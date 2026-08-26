@@ -1,0 +1,406 @@
+openapi: 3.1.0
+info:
+  title: Landbook (Netprisma/Landecia) Cloud API
+  description: |
+    Unofficial OpenAPI specification for the Landbook smart home cloud REST API,
+    reverse-engineered from the Landbook mobile app (iOS v3.6.0). Covers
+    authentication, device discovery, TSL model fetch, and token refresh.
+
+    Regional base URLs:
+    - US: https://iot-api.quectelus.com
+    - EU: https://iot-api.quecteleu.com
+    - CN: https://iot-gateway.quectel.com
+  version: 0.1.0
+  license:
+    name: MIT
+    identifier: MIT
+  contact:
+    name: Zack Wagner
+    url: https://github.com/zackwag/landbook-api
+
+servers:
+  - url: https://iot-api.quectelus.com
+    description: United States
+  - url: https://iot-api.quecteleu.com
+    description: Europe
+  - url: https://iot-gateway.quectel.com
+    description: China
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v2/enduser/enduserapi/emailPwdLogin:
+    post:
+      operationId: emailPwdLogin
+      summary: Authenticate with email and password
+      description: |
+        Authenticates a user and returns an access token (valid ~2 hours) and a
+        refresh token (valid ~30 days). The password must be AES-128-CBC
+        encrypted with a random 16-char key before submission.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/AppVersion"
+        - $ref: "#/components/parameters/AppSystemType"
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - email
+                - pwd
+                - random
+                - userDomain
+                - signature
+              properties:
+                email:
+                  type: string
+                  format: email
+                  description: User's email address.
+                pwd:
+                  type: string
+                  description: Base64-encoded AES-128-CBC encrypted password.
+                random:
+                  type: string
+                  minLength: 16
+                  maxLength: 16
+                  description: 16-character random alphanumeric string used as the encryption seed.
+                userDomain:
+                  type: string
+                  description: Region-specific user domain identifier (e.g. "U.SP.8589934603" for US).
+                signature:
+                  type: string
+                  description: SHA-256 hex digest of (email + pwd + random + app_domain_key).
+      responses:
+        "200":
+          description: Successful authentication.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "400":
+          description: Invalid request parameters.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Invalid credentials.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v2/enduser/enduserapi/refreshToken:
+    put:
+      operationId: refreshToken
+      summary: Refresh the access token
+      description: |
+        Exchanges the current refresh token for a new access/refresh token pair.
+        Both the current access token (as Authorization header) AND the refresh
+        token (as form body) are required. The refresh token rotates on every
+        successful call — persist the new one.
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/AppVersion"
+        - $ref: "#/components/parameters/AppSystemType"
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - refreshToken
+              properties:
+                refreshToken:
+                  type: string
+                  description: The full refresh token value (including "Bearer " prefix).
+      responses:
+        "200":
+          description: New token pair issued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RefreshTokenResponse"
+        "401":
+          description: Refresh token expired or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v2/binding/enduserapi/userDeviceList:
+    get:
+      operationId: getUserDeviceList
+      summary: List devices bound to the user account
+      description: Returns a paginated list of devices associated with the authenticated user.
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/AppVersion"
+        - $ref: "#/components/parameters/AppSystemType"
+        - name: page
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+          description: Page number (1-indexed).
+        - name: pageSize
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+          description: Number of devices per page.
+      responses:
+        "200":
+          description: Device list retrieved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceListResponse"
+        "401":
+          description: Unauthorized — token expired or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v2/binding/enduserapi/productTSL:
+    get:
+      operationId: getProductTSL
+      summary: Get the TSL (Thing Specification Language) model for a product
+      description: |
+        Returns the full TSL model for a given product key, which describes all
+        properties, events, and services the product supports. The client
+        typically filters for writable PROPERTY entries (subType contains "W").
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/AppVersion"
+        - $ref: "#/components/parameters/AppSystemType"
+        - name: pk
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Product key identifying the device model.
+      responses:
+        "200":
+          description: TSL model retrieved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TSLResponse"
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v2/binding/enduserapi/getDeviceBusinessAttributes:
+    get:
+      operationId: getDeviceBusinessAttributes
+      summary: Get current business attributes for a specific device
+      description: Returns the current attribute values for a device identified by product key and device key.
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/AppVersion"
+        - $ref: "#/components/parameters/AppSystemType"
+        - name: pk
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Product key.
+        - name: dk
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Device key.
+      responses:
+        "200":
+          description: Device attributes retrieved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceAttributesResponse"
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token returned by the login endpoint (prefixed with "Bearer ").
+
+  parameters:
+    AppId:
+      name: appId
+      in: header
+      required: true
+      schema:
+        type: string
+        default: "584"
+      description: Application identifier.
+    AppVersion:
+      name: appVersion
+      in: header
+      required: true
+      schema:
+        type: string
+        default: "3.6.0"
+      description: Application version string.
+    AppSystemType:
+      name: appSystemType
+      in: header
+      required: true
+      schema:
+        type: string
+        enum: [ios, android]
+        default: ios
+      description: Platform type.
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: integer
+          description: Non-200 status code indicating the error type.
+        msg:
+          type: string
+          description: Human-readable error message.
+
+    TokenPair:
+      type: object
+      properties:
+        accessToken:
+          type: object
+          properties:
+            token:
+              type: string
+              description: Bearer access token (includes "Bearer " prefix).
+        refreshToken:
+          type: object
+          properties:
+            token:
+              type: string
+              description: Refresh token (includes "Bearer " prefix). Rotates on each use.
+
+    LoginResponse:
+      type: object
+      properties:
+        code:
+          type: integer
+          enum: [200]
+        data:
+          $ref: "#/components/schemas/TokenPair"
+
+    RefreshTokenResponse:
+      type: object
+      properties:
+        code:
+          type: integer
+          enum: [200]
+        data:
+          $ref: "#/components/schemas/TokenPair"
+
+    Device:
+      type: object
+      properties:
+        deviceId:
+          type: string
+          description: Unique device identifier used for MQTT topics.
+        productKey:
+          type: string
+          description: Product key (pk) identifying the device model.
+        deviceKey:
+          type: string
+          description: Device key (dk) identifying the specific device.
+        deviceName:
+          type: string
+          description: User-assigned device name.
+        online:
+          type: boolean
+          description: Whether the device is currently online.
+
+    DeviceListResponse:
+      type: object
+      properties:
+        code:
+          type: integer
+          enum: [200]
+        data:
+          type: object
+          properties:
+            list:
+              type: array
+              items:
+                $ref: "#/components/schemas/Device"
+
+    TSLProperty:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Property identifier code.
+        name:
+          type: string
+          description: Human-readable property name.
+        type:
+          type: string
+          enum: [PROPERTY, EVENT, SERVICE]
+          description: TSL entry type.
+        subType:
+          type: string
+          description: Access mode flags (e.g. "RW" for read-write, "R" for read-only).
+        sort:
+          type: integer
+          description: Display sort order.
+        dataType:
+          type: string
+          description: Data type of the property value (e.g. "BOOL", "INT", "ENUM").
+        specs:
+          type: object
+          additionalProperties: true
+          description: Type-specific constraints (min, max, step, enum values, etc.).
+
+    TSLResponse:
+      type: object
+      properties:
+        code:
+          type: integer
+          enum: [200]
+        data:
+          type: object
+          properties:
+            properties:
+              type: array
+              items:
+                $ref: "#/components/schemas/TSLProperty"
+
+    DeviceAttributesResponse:
+      type: object
+      properties:
+        code:
+          type: integer
+          enum: [200]
+        data:
+          type: object
+          additionalProperties: true
+          description: Key-value map of current device attribute values.

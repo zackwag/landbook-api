@@ -1,0 +1,457 @@
+asyncapi: 3.0.0
+info:
+  title: Landbook (Netprisma/Landecia) MQTT API
+  version: 0.1.0
+  description: |
+    Unofficial AsyncAPI specification for the Landbook smart home MQTT interface,
+    reverse-engineered from the Landbook mobile app (iOS v3.6.0).
+
+    The MQTT broker is accessed over WebSocket/TLS on port 8443 at path `/ws/v2`
+    using MQTT v3.1.1. Authentication uses the Bearer token from the REST login
+    endpoint as the MQTT password (username is empty).
+
+    **Connection details:**
+    - Transport: WebSocket over TLS
+    - Port: 8443
+    - WebSocket path: `/ws/v2`
+    - Protocol: MQTT 3.1.1
+    - Keepalive: 40 seconds
+    - Client ID format: `qu_{uid}_{timestamp_ms}`
+    - Username: (empty string)
+    - Password: Bearer access token from REST login
+  license:
+    name: MIT
+    identifier: MIT
+  contact:
+    name: Zack Wagner
+    url: https://github.com/zackwag/landbook-api
+
+servers:
+  us:
+    host: iot-south.landecia.com:8443
+    pathname: /ws/v2
+    protocol: mqtt
+    protocolVersion: "3.1.1"
+    description: United States
+    security:
+      - $ref: "#/components/securitySchemes/bearerToken"
+    bindings:
+      mqtt:
+        clientId: qu_{uid}_{timestamp_ms}
+        keepAlive: 40
+
+  eu:
+    host: iot-south.quecteleu.com:8443
+    pathname: /ws/v2
+    protocol: mqtt
+    protocolVersion: "3.1.1"
+    description: Europe
+    security:
+      - $ref: "#/components/securitySchemes/bearerToken"
+    bindings:
+      mqtt:
+        clientId: qu_{uid}_{timestamp_ms}
+        keepAlive: 40
+
+  cn:
+    host: iot-south.quectelcn.com:8443
+    pathname: /ws/v2
+    protocol: mqtt
+    protocolVersion: "3.1.1"
+    description: China
+    security:
+      - $ref: "#/components/securitySchemes/bearerToken"
+    bindings:
+      mqtt:
+        clientId: qu_{uid}_{timestamp_ms}
+        keepAlive: 40
+
+channels:
+  deviceCommand:
+    address: q/1/d/{device_id}/sys_
+    description: |
+      Upstream command channel. Clients publish READ-ATTR and WRITE-ATTR
+      messages to this topic to read or control device properties.
+    parameters:
+      device_id:
+        description: Unique device identifier (from the REST device list).
+    messages:
+      readAttr:
+        $ref: "#/components/messages/ReadAttrCommand"
+      writeAttr:
+        $ref: "#/components/messages/WriteAttrCommand"
+
+  deviceAck:
+    address: q/2/d/{device_id}/ack_
+    description: |
+      Acknowledgement channel. The device publishes responses to commands
+      (READ-ATTR and WRITE-ATTR replies) on this topic.
+    parameters:
+      device_id:
+        description: Unique device identifier.
+    messages:
+      ack:
+        $ref: "#/components/messages/DeviceAck"
+
+  deviceBus:
+    address: q/2/d/{device_id}/bus_
+    description: |
+      Business event channel. The device publishes property change
+      notifications (state updates) on this topic.
+    parameters:
+      device_id:
+        description: Unique device identifier.
+    messages:
+      busEvent:
+        $ref: "#/components/messages/DeviceBusEvent"
+
+  deviceOnline:
+    address: q/2/d/{device_id}/onl_
+    description: |
+      Online status channel. Publishes when the device comes online or goes
+      offline.
+    parameters:
+      device_id:
+        description: Unique device identifier.
+    messages:
+      onlineStatus:
+        $ref: "#/components/messages/DeviceOnlineStatus"
+
+  deviceOta:
+    address: q/2/d/{device_id}/ota_
+    description: |
+      OTA (Over-The-Air) update channel. Publishes firmware update progress
+      and status notifications.
+    parameters:
+      device_id:
+        description: Unique device identifier.
+    messages:
+      otaEvent:
+        $ref: "#/components/messages/DeviceOtaEvent"
+
+  deviceInfo:
+    address: q/2/d/{device_id}/inf_
+    description: |
+      Device info channel. Publishes device metadata and information updates.
+    parameters:
+      device_id:
+        description: Unique device identifier.
+    messages:
+      infoEvent:
+        $ref: "#/components/messages/DeviceInfoEvent"
+
+  deviceLocation:
+    address: q/2/d/{device_id}/loc_
+    description: |
+      Location channel. Publishes device location updates.
+    parameters:
+      device_id:
+        description: Unique device identifier.
+    messages:
+      locationEvent:
+        $ref: "#/components/messages/DeviceLocationEvent"
+
+operations:
+  sendReadAttr:
+    action: send
+    channel:
+      $ref: "#/channels/deviceCommand"
+    summary: Request current property values from a device.
+    description: |
+      Publishes a READ-ATTR message to request the current values of one or
+      more property codes from the device. The device responds on the ack_
+      topic.
+    messages:
+      - $ref: "#/channels/deviceCommand/messages/readAttr"
+    bindings:
+      mqtt:
+        qos: 1
+
+  sendWriteAttr:
+    action: send
+    channel:
+      $ref: "#/channels/deviceCommand"
+    summary: Set property values on a device.
+    description: |
+      Publishes a WRITE-ATTR message to change one or more property values
+      on the device. The device acknowledges on the ack_ topic and emits
+      state changes on the bus_ topic.
+    messages:
+      - $ref: "#/channels/deviceCommand/messages/writeAttr"
+    bindings:
+      mqtt:
+        qos: 1
+
+  receiveAck:
+    action: receive
+    channel:
+      $ref: "#/channels/deviceAck"
+    summary: Receive command acknowledgements from a device.
+    messages:
+      - $ref: "#/channels/deviceAck/messages/ack"
+    bindings:
+      mqtt:
+        qos: 1
+
+  receiveBusEvent:
+    action: receive
+    channel:
+      $ref: "#/channels/deviceBus"
+    summary: Receive property change notifications from a device.
+    messages:
+      - $ref: "#/channels/deviceBus/messages/busEvent"
+    bindings:
+      mqtt:
+        qos: 1
+
+  receiveOnlineStatus:
+    action: receive
+    channel:
+      $ref: "#/channels/deviceOnline"
+    summary: Receive online/offline status changes for a device.
+    messages:
+      - $ref: "#/channels/deviceOnline/messages/onlineStatus"
+    bindings:
+      mqtt:
+        qos: 1
+
+  receiveOtaEvent:
+    action: receive
+    channel:
+      $ref: "#/channels/deviceOta"
+    summary: Receive OTA update notifications for a device.
+    messages:
+      - $ref: "#/channels/deviceOta/messages/otaEvent"
+    bindings:
+      mqtt:
+        qos: 1
+
+  receiveInfoEvent:
+    action: receive
+    channel:
+      $ref: "#/channels/deviceInfo"
+    summary: Receive device info updates.
+    messages:
+      - $ref: "#/channels/deviceInfo/messages/infoEvent"
+    bindings:
+      mqtt:
+        qos: 1
+
+  receiveLocationEvent:
+    action: receive
+    channel:
+      $ref: "#/channels/deviceLocation"
+    summary: Receive device location updates.
+    messages:
+      - $ref: "#/channels/deviceLocation/messages/locationEvent"
+    bindings:
+      mqtt:
+        qos: 1
+
+components:
+  securitySchemes:
+    bearerToken:
+      type: userPassword
+      description: |
+        MQTT username is an empty string. MQTT password is the Bearer access
+        token obtained from the REST login endpoint.
+
+  schemas:
+    CommandBase:
+      type: object
+      required:
+        - msgId
+        - productKey
+        - deviceKey
+        - type
+        - kv
+      properties:
+        msgId:
+          type: integer
+          description: Incrementing message counter (wraps at 0xFFFF).
+        productKey:
+          type: string
+          description: Product key identifying the device model.
+        deviceKey:
+          type: string
+          description: Device key identifying the specific device.
+        type:
+          type: string
+          description: Command type.
+        kv:
+          type: string
+          description: JSON-encoded payload (codes array for READ, props array for WRITE).
+        cacheTime:
+          type: integer
+          default: 0
+        isCache:
+          type: boolean
+          default: false
+        isCover:
+          type: boolean
+          default: false
+
+    ReadAttrPayload:
+      allOf:
+        - $ref: "#/components/schemas/CommandBase"
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [READ-ATTR]
+            kv:
+              type: string
+              description: |
+                JSON-encoded array of property code strings to read.
+                Example: `'["switch","brightness","color_temp"]'`
+
+    WriteAttrPayload:
+      allOf:
+        - $ref: "#/components/schemas/CommandBase"
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [WRITE-ATTR]
+            kv:
+              type: string
+              description: |
+                JSON-encoded array containing a single object with property
+                key-value pairs to set.
+                Example: `'[{"switch":true,"brightness":80}]'`
+
+    AckPayload:
+      type: object
+      properties:
+        msgId:
+          type: integer
+          description: Message ID echoed from the original command.
+        type:
+          type: string
+          description: Response type (e.g. "READ-ATTR-ACK", "WRITE-ATTR-ACK").
+        kv:
+          type: object
+          additionalProperties: true
+          description: Key-value map of current property values.
+
+    BusEventPayload:
+      type: object
+      properties:
+        type:
+          type: string
+          description: Event type (e.g. "ATTR-REPORT").
+        kv:
+          type: object
+          additionalProperties: true
+          description: Key-value map of changed property values.
+
+    OnlineStatusPayload:
+      type: object
+      properties:
+        online:
+          type: boolean
+          description: Whether the device is currently online.
+
+    OtaEventPayload:
+      type: object
+      additionalProperties: true
+      description: OTA update progress and status information.
+
+    InfoEventPayload:
+      type: object
+      additionalProperties: true
+      description: Device metadata and information updates.
+
+    LocationEventPayload:
+      type: object
+      additionalProperties: true
+      description: Device location data.
+
+  messages:
+    ReadAttrCommand:
+      name: readAttr
+      title: Read Attribute Command
+      summary: Request current values for specified property codes.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/ReadAttrPayload"
+      examples:
+        - name: readSwitchAndBrightness
+          summary: Read the switch state and brightness level.
+          payload:
+            msgId: 1001
+            productKey: "p1234abc"
+            deviceKey: "d5678def"
+            type: READ-ATTR
+            kv: '["switch","brightness"]'
+            cacheTime: 0
+            isCache: false
+            isCover: false
+
+    WriteAttrCommand:
+      name: writeAttr
+      title: Write Attribute Command
+      summary: Set property values on the device.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/WriteAttrPayload"
+      examples:
+        - name: turnOnAndSetBrightness
+          summary: Turn on the device and set brightness to 80%.
+          payload:
+            msgId: 1002
+            productKey: "p1234abc"
+            deviceKey: "d5678def"
+            type: WRITE-ATTR
+            kv: '[{"switch":true,"brightness":80}]'
+            cacheTime: 0
+            isCache: false
+            isCover: false
+
+    DeviceAck:
+      name: deviceAck
+      title: Device Acknowledgement
+      summary: Command response from the device.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/AckPayload"
+
+    DeviceBusEvent:
+      name: deviceBusEvent
+      title: Device Bus Event
+      summary: Property change notification from the device.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/BusEventPayload"
+
+    DeviceOnlineStatus:
+      name: deviceOnlineStatus
+      title: Device Online Status
+      summary: Online/offline status change notification.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/OnlineStatusPayload"
+
+    DeviceOtaEvent:
+      name: deviceOtaEvent
+      title: Device OTA Event
+      summary: Firmware update progress notification.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/OtaEventPayload"
+
+    DeviceInfoEvent:
+      name: deviceInfoEvent
+      title: Device Info Event
+      summary: Device information update.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/InfoEventPayload"
+
+    DeviceLocationEvent:
+      name: deviceLocationEvent
+      title: Device Location Event
+      summary: Device location update.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/LocationEventPayload"
