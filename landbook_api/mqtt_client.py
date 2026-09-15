@@ -36,6 +36,17 @@ class LandbookMQTTClient:
         self._msg_counter = 1000
         self._reconnect_timer: threading.Timer | None = None
 
+        # Serialize all wire operations. The same client instance is shared
+        # across every device of one account (multiple concurrent publishers)
+        # and is invoked both from the caller's thread and from paho's network
+        # loop thread (_on_connect -> _on_reconnect). Concurrent publish()
+        # calls race on paho's internal _sendbuffer and raise BufferError
+        # ("Existing exports of data: object cannot be re-sized"), so every
+        # socket op takes a per-instance lock. RLock because _subscribe_topics
+        # is called both externally (via subscribe_device, already locked) and
+        # internally from _on_connect on the network thread.
+        self._wire_lock = threading.RLock()
+
         # device_id -> list of callbacks
         self._listeners: dict[str, list[Callable[[str, Any], None]]] = {}
         # called after (re)connect to refresh state
@@ -85,15 +96,16 @@ class LandbookMQTTClient:
             self._reconnect_timer = None
 
     def disconnect(self) -> None:
-        self._shutting_down = True
-        if self._reconnect_timer:
-            self._reconnect_timer.cancel()
-            self._reconnect_timer = None
-        if self._client:
-            self._client.loop_stop()
-            self._client.disconnect()
-            self._client = None
-        self._connected = False
+        with self._wire_lock:
+            self._shutting_down = True
+            if self._reconnect_timer:
+                self._reconnect_timer.cancel()
+                self._reconnect_timer = None
+            if self._client:
+                self._client.loop_stop()
+                self._client.disconnect()
+                self._client = None
+            self._connected = False
 
     def subscribe_device(
         self,
@@ -104,63 +116,67 @@ class LandbookMQTTClient:
 
         callback(topic_suffix, payload_dict)
         """
-        if device_id not in self._listeners:
-            self._listeners[device_id] = []
-            if self._client and self._connected:
-                self._subscribe_topics(device_id)
+        with self._wire_lock:
+            if device_id not in self._listeners:
+                self._listeners[device_id] = []
+                if self._client and self._connected:
+                    self._subscribe_topics(device_id)
 
-        self._listeners[device_id].append(callback)
+            self._listeners[device_id].append(callback)
 
     def send_read(self, device_id: str, pk: str, dk: str, codes: list[str]) -> None:
         """Request current values for the given property codes (READ-ATTR)."""
-        if not self._client or not self._connected:
-            return
-        self._msg_counter = (self._msg_counter + 1) & 0xFFFF
-        payload = json.dumps(
-            {
-                "msgId": self._msg_counter,
-                "productKey": pk,
-                "deviceKey": dk,
-                "type": "READ-ATTR",
-                "kv": json.dumps(codes),
-                "cacheTime": 0,
-                "isCache": False,
-                "isCover": False,
-            }
-        )
-        self._client.publish(f"q/1/d/{device_id}/sys_", payload, qos=1)
-        _LOGGER.debug("send_read device=%s codes=%s", device_id, codes)
+        with self._wire_lock:
+            if not self._client or not self._connected:
+                return
+            self._msg_counter = (self._msg_counter + 1) & 0xFFFF
+            payload = json.dumps(
+                {
+                    "msgId": self._msg_counter,
+                    "productKey": pk,
+                    "deviceKey": dk,
+                    "type": "READ-ATTR",
+                    "kv": json.dumps(codes),
+                    "cacheTime": 0,
+                    "isCache": False,
+                    "isCover": False,
+                }
+            )
+            self._client.publish(f"q/1/d/{device_id}/sys_", payload, qos=1)
+            _LOGGER.debug("send_read device=%s codes=%s", device_id, codes)
 
     def send_write(self, device_id: str, pk: str, dk: str, props: dict) -> None:
         """Publish a WRITE-ATTR command."""
-        if not self._client or not self._connected:
-            raise ConnectionError("MQTT not connected")
+        with self._wire_lock:
+            if not self._client or not self._connected:
+                raise ConnectionError("MQTT not connected")
 
-        self._msg_counter = (self._msg_counter + 1) & 0xFFFF
-        payload = json.dumps(
-            {
-                "msgId": self._msg_counter,
-                "productKey": pk,
-                "deviceKey": dk,
-                "type": "WRITE-ATTR",
-                "kv": json.dumps([props]),
-                "cacheTime": 0,
-                "isCache": False,
-                "isCover": False,
-            }
-        )
-        self._client.publish(f"q/1/d/{device_id}/sys_", payload, qos=1)
-        _LOGGER.debug("send_write device=%s props=%s", device_id, props)
+            self._msg_counter = (self._msg_counter + 1) & 0xFFFF
+            payload = json.dumps(
+                {
+                    "msgId": self._msg_counter,
+                    "productKey": pk,
+                    "deviceKey": dk,
+                    "type": "WRITE-ATTR",
+                    "kv": json.dumps([props]),
+                    "cacheTime": 0,
+                    "isCache": False,
+                    "isCover": False,
+                }
+            )
+            self._client.publish(f"q/1/d/{device_id}/sys_", payload, qos=1)
+            _LOGGER.debug("send_write device=%s props=%s", device_id, props)
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
     def _subscribe_topics(self, device_id: str) -> None:
-        assert self._client
-        # Subscribe to all known downstream topics for this device
-        for suffix in ("ack_", "bus_", "onl_", "ota_", "inf_", "loc_"):
-            self._client.subscribe(f"q/2/d/{device_id}/{suffix}", qos=1)
+        with self._wire_lock:
+            assert self._client
+            # Subscribe to all known downstream topics for this device
+            for suffix in ("ack_", "bus_", "onl_", "ota_", "inf_", "loc_"):
+                self._client.subscribe(f"q/2/d/{device_id}/{suffix}", qos=1)
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         if str(reason_code) in ("Success", "0") or reason_code == 0:
