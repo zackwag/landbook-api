@@ -241,3 +241,33 @@ class TestMsgCounterWraps:
         p2 = json.loads(mock_mqtt.publish.call_args_list[1][0][1])
         assert p1["msgId"] == 0xFFFF
         assert p2["msgId"] == 0
+
+
+class TestConnectTimeout:
+    @patch("landbook_api.mqtt_client.time.sleep")
+    @patch("landbook_api.mqtt_client.mqtt.Client")
+    def test_timeout_stops_loop_and_clears_client(self, mock_cls, mock_sleep):
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        c = LandbookMQTTClient(uid="u1", bearer_token="Bearer tok")
+        with pytest.raises(ConnectionError, match="MQTT connection timed out"):
+            c.connect()
+        mock_client.loop_stop.assert_called_once()
+        mock_client.disconnect.assert_called_once()
+        assert c._client is None
+
+    @patch("landbook_api.mqtt_client.time.sleep")
+    @patch("landbook_api.mqtt_client.mqtt.Client")
+    def test_successful_connect_keeps_client(self, mock_cls, mock_sleep):
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        c = LandbookMQTTClient(uid="u1", bearer_token="Bearer tok")
+
+        def _simulate_connect(*_a, **_kw):
+            c._connected = True
+
+        mock_client.connect.side_effect = _simulate_connect
+        c.connect()
+        mock_client.loop_stop.assert_not_called()
+        mock_client.disconnect.assert_not_called()
+        assert c._client is mock_client

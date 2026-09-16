@@ -82,6 +82,9 @@ class LandbookMQTTClient:
             time.sleep(0.25)
 
         if not self._connected:
+            client.loop_stop()
+            client.disconnect()
+            self._client = None
             raise ConnectionError("MQTT connection timed out")
 
     def update_token(self, bearer_token: str) -> None:
