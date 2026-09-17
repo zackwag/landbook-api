@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/zackwag/landbook-api/compare/v0.4.0...v0.4.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* seed msgId counter from wall-clock time, not a fixed value ([#17](https://github.com/zackwag/landbook-api/issues/17)) ([2c5e40c](https://github.com/zackwag/landbook-api/commit/2c5e40ce1e8eb8429ecbe1ae763a0baf2d04ef19))
+
 ## [0.4.0](https://github.com/zackwag/landbook-api/compare/v0.3.1...v0.4.0) (2026-09-17)
 
 
