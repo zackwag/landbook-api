@@ -40,7 +40,15 @@ class LandbookMQTTClient:
         self._connected = False
         self._shutting_down = False
         self._reauth_pending = False
-        self._msg_counter = 1000
+        # Seeded from wall-clock time (mod 2**16) rather than a fixed low
+        # value: a fresh client instance is created on every integration
+        # reload/restart, and a fixed seed meant every such session replayed
+        # the same ~1001-1018 msgId range. If the server dedups/rejects
+        # recently-seen msgIds (independent of the underlying connection),
+        # that guarantees collisions across sessions. Time-seeding makes
+        # collisions between two sessions' id ranges unlikely without
+        # requiring any persisted state.
+        self._msg_counter = int(time.time() * 1000) & 0xFFFF
         self._reconnect_timer: threading.Timer | None = None
         # (deadline, device_id, pk, dk, props) for writes that hit a
         # disconnected client; replayed in order by _flush_deferred_writes
