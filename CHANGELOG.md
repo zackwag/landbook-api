@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/zackwag/landbook-api/compare/v0.3.1...v0.4.0) (2026-09-17)
+
+
+### Features
+
+* **ci:** add ruff lint + format check ([#15](https://github.com/zackwag/landbook-api/issues/15)) ([168ab6d](https://github.com/zackwag/landbook-api/commit/168ab6d93722030c10d7cd50aff52566fd7a3ccd))
+
 ## [0.3.1](https://github.com/zackwag/landbook-api/compare/v0.3.0...v0.3.1) (2026-09-17)
 
 
