@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "landbook-api"
-version = "0.3.1"
+version = "0.4.0"
 description = "Unofficial Python client for the Landbook (Netprisma/Landecia) smart home cloud API — REST auth/device discovery and MQTT pub/sub."
 readme = "README.md"
 license = "MIT"
