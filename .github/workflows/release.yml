@@ -4,11 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to release (e.g. 0.1.0), no leading v"
-        required: true
 
 jobs:
   build:
@@ -41,43 +36,3 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true
-
-  github-release:
-    needs: publish-pypi
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Get version
-        id: version
-        run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Extract changelog entry
-        id: changelog
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          NOTES=$(awk "/^## \[$VERSION\]/{found=1; next} found && /^## /{exit} found{print}" CHANGELOG.md | sed '/^[[:space:]]*$/d')
-          {
-            echo "notes<<EOF"
-            echo "## What's Changed"
-            echo ""
-            echo "$NOTES"
-            echo ""
-            echo "**Full changelog:** https://github.com/zackwag/landbook-api/blob/main/CHANGELOG.md"
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: "v${{ steps.version.outputs.version }}"
-          name: "v${{ steps.version.outputs.version }}"
-          body: "${{ steps.changelog.outputs.notes }}"
-          make_latest: true
