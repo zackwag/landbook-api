@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/zackwag/landbook-api/compare/v0.2.0...v0.3.0) (2026-09-17)
+
+
+### Features
+
+* **ci:** adopt release-please ([#11](https://github.com/zackwag/landbook-api/issues/11)) ([b86ffa3](https://github.com/zackwag/landbook-api/commit/b86ffa3acda07e1a603ba0a528ffbeb67679fb89))
+
 ## [0.2.0] - 2026-09-17
 
 - `LandbookMQTTClient.connect()` now tears down the half-started paho loop before raising `ConnectionError` on a connect timeout, instead of leaking a background thread that keeps retrying with a stale token.
