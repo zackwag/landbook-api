@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/zackwag/landbook-api/compare/v0.3.0...v0.3.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* **ci:** use RELEASE_PLEASE_TOKEN so releases trigger downstream workflows ([#13](https://github.com/zackwag/landbook-api/issues/13)) ([727818b](https://github.com/zackwag/landbook-api/commit/727818b6c5406007a921a38e8b049f8387620a62))
+
 ## [0.3.0](https://github.com/zackwag/landbook-api/compare/v0.2.0...v0.3.0) (2026-09-17)
 
 
