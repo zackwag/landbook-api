@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from landbook_api import LandbookMQTTClient, DEFAULT_REGION, REGIONS
+from landbook_api.mqtt_client import WRITE_RETRY_WINDOW
 
 
 @pytest.fixture
@@ -139,9 +140,10 @@ class TestSendWrite:
         assert payload["type"] == "WRITE-ATTR"
         assert json.loads(payload["kv"]) == [{"switch": True}]
 
-    def test_raises_when_not_connected(self, client):
-        with pytest.raises(ConnectionError):
-            client.send_write("dev1", "pk1", "dk1", {"switch": True})
+    def test_defers_instead_of_raising_when_not_connected(self, client):
+        client.send_write("dev1", "pk1", "dk1", {"switch": True})
+        assert len(client._deferred_writes) == 1
+        assert client._deferred_writes[0][1:] == ("dev1", "pk1", "dk1", {"switch": True})
 
 
 class TestOnMessage:
@@ -271,3 +273,83 @@ class TestConnectTimeout:
         mock_client.loop_stop.assert_not_called()
         mock_client.disconnect.assert_not_called()
         assert c._client is mock_client
+
+
+class TestDeferredWrites:
+    """send_write must queue across a disconnect instead of raising, and
+    replay the queue in order once the connection comes back."""
+
+    def test_flush_resends_deferred_writes_in_order(self, client):
+        client.send_write("dev1", "pk", "dk1", {"switch": True})
+        client.send_write("dev1", "pk", "dk1", {"speed": 5})
+
+        mock_mqtt = MagicMock()
+        client._client = mock_mqtt
+        client._connected = True
+        client._flush_deferred_writes()
+
+        payloads = [json.loads(c[0][1]) for c in mock_mqtt.publish.call_args_list]
+        assert [json.loads(p["kv"]) for p in payloads] == [
+            [{"switch": True}],
+            [{"speed": 5}],
+        ]
+        assert client._deferred_writes == []
+
+    def test_flush_noop_while_still_disconnected(self, client):
+        client.send_write("dev1", "pk", "dk1", {"switch": True})
+        client._flush_deferred_writes()
+        assert len(client._deferred_writes) == 1
+
+    def test_flush_drops_expired_writes(self, client):
+        client.send_write("dev1", "pk", "dk1", {"switch": True})
+        deadline, device_id, pk, dk, props = client._deferred_writes[0]
+        client._deferred_writes[0] = (
+            deadline - WRITE_RETRY_WINDOW - 1,
+            device_id,
+            pk,
+            dk,
+            props,
+        )
+
+        mock_mqtt = MagicMock()
+        client._client = mock_mqtt
+        client._connected = True
+        client._flush_deferred_writes()
+
+        mock_mqtt.publish.assert_not_called()
+        assert client._deferred_writes == []
+
+    def test_on_connect_flushes_before_on_reconnect_callback(self, client):
+        client.send_write("dev1", "pk", "dk1", {"switch": True})
+        client._client = MagicMock()
+
+        calls = []
+        client._on_reconnect = lambda: calls.append("on_reconnect")
+        orig_flush = client._flush_deferred_writes
+        client._flush_deferred_writes = lambda: (calls.append("flush"), orig_flush())
+
+        client._on_connect(None, None, None, 0, None)
+
+        assert calls[0] == "flush"
+        assert client._deferred_writes == []
+
+
+class TestReconnect:
+    def test_tears_down_and_reconnects(self, client):
+        old_mqtt = MagicMock()
+        client._client = old_mqtt
+        client._connected = True
+        client._shutting_down = True
+        timer = MagicMock()
+        client._reconnect_timer = timer
+
+        with patch.object(LandbookMQTTClient, "connect") as mock_connect:
+            client.reconnect()
+
+        old_mqtt.loop_stop.assert_called_once()
+        old_mqtt.disconnect.assert_called_once()
+        timer.cancel.assert_called_once()
+        assert client._client is None
+        assert client._connected is False
+        assert client._shutting_down is False
+        mock_connect.assert_called_once()

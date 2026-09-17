@@ -14,6 +14,12 @@ from .const import MQTT_KEEPALIVE, MQTT_PORT, MQTT_WS_PATH, REGIONS, DEFAULT_REG
 
 _LOGGER = logging.getLogger(__name__)
 
+# How long a write that failed because the connection was momentarily down
+# stays queued for replay on reconnect. Longer than the ~1-3s blip caused by
+# a token-rotation reconnect, short enough that a tap during a genuine outage
+# isn't silently applied minutes later.
+WRITE_RETRY_WINDOW = 5.0  # seconds
+
 
 class LandbookMQTTClient:
     """Manages a single persistent MQTT connection for one account."""
@@ -35,6 +41,10 @@ class LandbookMQTTClient:
         self._reauth_pending = False
         self._msg_counter = 1000
         self._reconnect_timer: threading.Timer | None = None
+        # (deadline, device_id, pk, dk, props) for writes that hit a
+        # disconnected client; replayed in order by _flush_deferred_writes
+        # once the connection comes back.
+        self._deferred_writes: list[tuple[float, str, str, str, dict]] = []
 
         # Serialize all wire operations. The same client instance is shared
         # across every device of one account (multiple concurrent publishers)
@@ -110,6 +120,26 @@ class LandbookMQTTClient:
                 self._client = None
             self._connected = False
 
+    def reconnect(self) -> None:
+        """Tear down and re-establish the connection from scratch.
+
+        For a caller (e.g. a watchdog) that has independently determined the
+        connection is silently dead — the broker can drop a WebSocket link
+        mid-stream without paho ever calling on_disconnect, so keepalive
+        alone doesn't catch it.
+        """
+        with self._wire_lock:
+            self._shutting_down = False
+            if self._reconnect_timer:
+                self._reconnect_timer.cancel()
+                self._reconnect_timer = None
+            if self._client:
+                self._client.loop_stop()
+                self._client.disconnect()
+                self._client = None
+            self._connected = False
+        self.connect()
+
     def subscribe_device(
         self,
         device_id: str,
@@ -149,26 +179,62 @@ class LandbookMQTTClient:
             _LOGGER.debug("send_read device=%s codes=%s", device_id, codes)
 
     def send_write(self, device_id: str, pk: str, dk: str, props: dict) -> None:
-        """Publish a WRITE-ATTR command."""
+        """Publish a WRITE-ATTR command.
+
+        If the connection is momentarily down (e.g. the ~1-3s blip during a
+        token-rotation reconnect), the write is queued instead of raising and
+        is replayed in order once the connection comes back — see
+        _flush_deferred_writes. A write still queued after WRITE_RETRY_WINDOW
+        is dropped rather than applied late.
+        """
         with self._wire_lock:
             if not self._client or not self._connected:
-                raise ConnectionError("MQTT not connected")
+                self._deferred_writes.append(
+                    (time.monotonic() + WRITE_RETRY_WINDOW, device_id, pk, dk, props)
+                )
+                _LOGGER.info(
+                    "Landbook: write to %s deferred (MQTT down), will resend on reconnect", dk
+                )
+                return
+            self._publish_write(device_id, pk, dk, props)
 
-            self._msg_counter = (self._msg_counter + 1) & 0xFFFF
-            payload = json.dumps(
-                {
-                    "msgId": self._msg_counter,
-                    "productKey": pk,
-                    "deviceKey": dk,
-                    "type": "WRITE-ATTR",
-                    "kv": json.dumps([props]),
-                    "cacheTime": 0,
-                    "isCache": False,
-                    "isCover": False,
-                }
-            )
-            self._client.publish(f"q/1/d/{device_id}/sys_", payload, qos=1)
-            _LOGGER.debug("send_write device=%s props=%s", device_id, props)
+    def _publish_write(self, device_id: str, pk: str, dk: str, props: dict) -> None:
+        assert self._client
+        self._msg_counter = (self._msg_counter + 1) & 0xFFFF
+        payload = json.dumps(
+            {
+                "msgId": self._msg_counter,
+                "productKey": pk,
+                "deviceKey": dk,
+                "type": "WRITE-ATTR",
+                "kv": json.dumps([props]),
+                "cacheTime": 0,
+                "isCache": False,
+                "isCover": False,
+            }
+        )
+        self._client.publish(f"q/1/d/{device_id}/sys_", payload, qos=1)
+        _LOGGER.debug("send_write device=%s props=%s", device_id, props)
+
+    def _flush_deferred_writes(self) -> None:
+        now = time.monotonic()
+        with self._wire_lock:
+            idx = 0
+            while idx < len(self._deferred_writes):
+                deadline, device_id, pk, dk, props = self._deferred_writes[idx]
+                if now > deadline:
+                    _LOGGER.info(
+                        "Landbook: dropping deferred write to %s (expired while disconnected)",
+                        dk,
+                    )
+                    idx += 1
+                    continue
+                if not self._client or not self._connected:
+                    break
+                self._publish_write(device_id, pk, dk, props)
+                idx += 1
+            if idx:
+                del self._deferred_writes[:idx]
 
     # ------------------------------------------------------------------
     # Internal
@@ -187,6 +253,7 @@ class LandbookMQTTClient:
             for device_id in self._listeners:
                 self._subscribe_topics(device_id)
             _LOGGER.info("Landbook MQTT connected")
+            self._flush_deferred_writes()
             if self._on_reconnect:
                 self._on_reconnect()
         else:
