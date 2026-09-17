@@ -3,6 +3,7 @@
 Covers REST auth/device discovery/TSL model fetch and the WebSocket/TLS MQTT
 pub/sub channel used for real-time device control and state.
 """
+
 from .api import (
     LandbookAPIError,
     LandbookAuthError,
@@ -23,19 +24,19 @@ from .mqtt_client import LandbookMQTTClient
 __version__ = "0.3.1"  # x-release-please-version
 
 __all__ = [
+    "DEFAULT_REGION",
+    "REGIONS",
     "LandbookAPIError",
     "LandbookAuthError",
     "LandbookMQTTClient",
-    "DEFAULT_REGION",
-    "REGIONS",
-    "login",
-    "async_login",
-    "get_device_list",
+    "async_get_device_attributes",
     "async_get_device_list",
-    "get_tsl",
     "async_get_tsl",
-    "refresh_token",
+    "async_login",
     "async_refresh_token",
     "get_device_attributes",
-    "async_get_device_attributes",
+    "get_device_list",
+    "get_tsl",
+    "login",
+    "refresh_token",
 ]

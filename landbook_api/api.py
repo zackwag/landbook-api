@@ -1,4 +1,5 @@
 """Landbook API client — auth, device discovery, TSL model fetch."""
+
 from __future__ import annotations
 
 import asyncio
@@ -67,9 +68,7 @@ def login(email: str, password: str, region: str = DEFAULT_REGION) -> tuple[str,
     cfg = _region_cfg(region)
     pwd, rand = _encrypt_password(password)
 
-    sig = hashlib.sha256(
-        (email + pwd + rand + cfg["app_domain_key"]).encode()
-    ).hexdigest()
+    sig = hashlib.sha256((email + pwd + rand + cfg["app_domain_key"]).encode()).hexdigest()
 
     data = urllib.parse.urlencode(
         {
@@ -119,7 +118,9 @@ def _api_get(bearer_token: str, api_base: str, path: str, params: dict | None = 
 
 def get_device_list(bearer_token: str, region: str = DEFAULT_REGION) -> list[dict]:
     api_base = _region_cfg(region)["api_base"]
-    data = _api_get(bearer_token, api_base, "/v2/binding/enduserapi/userDeviceList", {"page": 1, "pageSize": 50})
+    data = _api_get(
+        bearer_token, api_base, "/v2/binding/enduserapi/userDeviceList", {"page": 1, "pageSize": 50}
+    )
     return data.get("list", [])
 
 
@@ -127,14 +128,17 @@ def get_tsl(bearer_token: str, pk: str, region: str = DEFAULT_REGION) -> list[di
     api_base = _region_cfg(region)["api_base"]
     data = _api_get(bearer_token, api_base, "/v2/binding/enduserapi/productTSL", {"pk": pk})
     properties = [
-        p for p in data.get("properties", [])
+        p
+        for p in data.get("properties", [])
         if "W" in p.get("subType", "") and p["type"] == "PROPERTY"
     ]
     properties.sort(key=lambda p: p.get("sort", 0))
     return properties
 
 
-def refresh_token(bearer_token: str, refresh_token_value: str, region: str = DEFAULT_REGION) -> tuple[str, str]:
+def refresh_token(
+    bearer_token: str, refresh_token_value: str, region: str = DEFAULT_REGION
+) -> tuple[str, str]:
     """Exchange the refresh token for a new (access_token, refresh_token) pair.
 
     The API requires BOTH the current access token as the Authorization
@@ -167,12 +171,21 @@ def refresh_token(bearer_token: str, refresh_token_value: str, region: str = DEF
     return resp["data"]["accessToken"]["token"], resp["data"]["refreshToken"]["token"]
 
 
-def get_device_attributes(bearer_token: str, pk: str, dk: str, region: str = DEFAULT_REGION) -> dict:
+def get_device_attributes(
+    bearer_token: str, pk: str, dk: str, region: str = DEFAULT_REGION
+) -> dict:
     api_base = _region_cfg(region)["api_base"]
-    return _api_get(bearer_token, api_base, "/v2/binding/enduserapi/getDeviceBusinessAttributes", {"pk": pk, "dk": dk})
+    return _api_get(
+        bearer_token,
+        api_base,
+        "/v2/binding/enduserapi/getDeviceBusinessAttributes",
+        {"pk": pk, "dk": dk},
+    )
 
 
-async def async_login(email: str, password: str, region: str = DEFAULT_REGION) -> tuple[str, str, str]:
+async def async_login(
+    email: str, password: str, region: str = DEFAULT_REGION
+) -> tuple[str, str, str]:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, login, email, password, region)
 
@@ -191,9 +204,13 @@ async def async_refresh_token(
     bearer_token: str, refresh_token_value: str, region: str = DEFAULT_REGION
 ) -> tuple[str, str]:
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, refresh_token, bearer_token, refresh_token_value, region)
+    return await loop.run_in_executor(
+        None, refresh_token, bearer_token, refresh_token_value, region
+    )
 
 
-async def async_get_device_attributes(bearer_token: str, pk: str, dk: str, region: str = DEFAULT_REGION) -> dict:
+async def async_get_device_attributes(
+    bearer_token: str, pk: str, dk: str, region: str = DEFAULT_REGION
+) -> dict:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, get_device_attributes, bearer_token, pk, dk, region)

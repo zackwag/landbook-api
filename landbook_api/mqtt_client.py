@@ -1,4 +1,5 @@
 """Landbook MQTT client — WebSocket/TLS connection, pub/sub."""
+
 from __future__ import annotations
 
 import json
@@ -10,7 +11,7 @@ from typing import Any
 
 import paho.mqtt.client as mqtt
 
-from .const import MQTT_KEEPALIVE, MQTT_PORT, MQTT_WS_PATH, REGIONS, DEFAULT_REGION
+from .const import DEFAULT_REGION, MQTT_KEEPALIVE, MQTT_PORT, MQTT_WS_PATH, REGIONS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -285,7 +286,7 @@ class LandbookMQTTClient:
             if self._token_refresher:
                 self._bearer_token = self._token_refresher()
                 _LOGGER.debug("Token refreshed before reconnect")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - best-effort refresh, fall back to old token rather than abort the reconnect
             _LOGGER.warning("Token refresh failed, reconnecting with old token: %s", exc)
         if self._reauth_pending:
             return
@@ -293,7 +294,7 @@ class LandbookMQTTClient:
             if self._client:
                 self._client.loop_stop()
             self.connect()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - retry loop, must survive any connect failure
             _LOGGER.warning("Reconnect failed: %s — will retry in 30s", exc)
             self._schedule_reconnect(delay=30)
 
@@ -307,7 +308,7 @@ class LandbookMQTTClient:
 
         try:
             payload = json.loads(msg.payload.decode())
-        except Exception:
+        except Exception:  # noqa: BLE001 - MQTT callback must not crash on a malformed/unexpected payload
             _LOGGER.debug("Non-JSON MQTT payload on %s", msg.topic)
             return
 

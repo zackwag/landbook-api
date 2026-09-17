@@ -1,31 +1,30 @@
 import asyncio
 import base64
 import json
-from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from landbook_api import DEFAULT_REGION, REGIONS, LandbookAuthError, LandbookAPIError
+from landbook_api import DEFAULT_REGION, REGIONS, LandbookAPIError, LandbookAuthError
 from landbook_api.api import (
     _encrypt_password,
     _region_cfg,
+    async_get_device_attributes,
+    async_get_device_list,
+    async_get_tsl,
+    async_login,
+    async_refresh_token,
     get_device_attributes,
     get_device_list,
     get_tsl,
     login,
     refresh_token,
-    async_login,
-    async_get_device_list,
-    async_get_tsl,
-    async_refresh_token,
-    async_get_device_attributes,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _fake_jwt(uid: str = "user123") -> str:
     payload = base64.b64encode(json.dumps({"uid": uid}).encode()).decode().rstrip("=")
@@ -41,6 +40,7 @@ def _mock_urlopen(body: dict):
 # ---------------------------------------------------------------------------
 # Region / encryption (existing + expanded)
 # ---------------------------------------------------------------------------
+
 
 def test_regions_have_required_keys():
     required = {"label", "api_base", "mqtt_host", "user_domain", "app_domain_key"}
@@ -82,6 +82,7 @@ def test_encrypt_password_empty_string():
 # ---------------------------------------------------------------------------
 # login()
 # ---------------------------------------------------------------------------
+
 
 class TestLogin:
     def _login_response(self, uid="user123"):
@@ -140,6 +141,7 @@ class TestLogin:
 # get_device_list()
 # ---------------------------------------------------------------------------
 
+
 class TestGetDeviceList:
     @patch("landbook_api.api.urllib.request.urlopen")
     def test_returns_device_list(self, mock_urlopen):
@@ -171,6 +173,7 @@ class TestGetDeviceList:
 # ---------------------------------------------------------------------------
 # get_tsl()
 # ---------------------------------------------------------------------------
+
 
 class TestGetTSL:
     @patch("landbook_api.api.urllib.request.urlopen")
@@ -214,29 +217,34 @@ class TestGetTSL:
 # refresh_token()
 # ---------------------------------------------------------------------------
 
+
 class TestRefreshToken:
     @patch("landbook_api.api.urllib.request.urlopen")
     def test_returns_new_token_pair(self, mock_urlopen):
-        mock_urlopen.return_value = _mock_urlopen({
-            "code": 200,
-            "data": {
-                "accessToken": {"token": "Bearer new_access"},
-                "refreshToken": {"token": "Bearer new_refresh"},
-            },
-        })
+        mock_urlopen.return_value = _mock_urlopen(
+            {
+                "code": 200,
+                "data": {
+                    "accessToken": {"token": "Bearer new_access"},
+                    "refreshToken": {"token": "Bearer new_refresh"},
+                },
+            }
+        )
         access, refresh = refresh_token("Bearer old", "Bearer old_refresh")
         assert access == "Bearer new_access"
         assert refresh == "Bearer new_refresh"
 
     @patch("landbook_api.api.urllib.request.urlopen")
     def test_sends_put_with_refresh_token_body(self, mock_urlopen):
-        mock_urlopen.return_value = _mock_urlopen({
-            "code": 200,
-            "data": {
-                "accessToken": {"token": "Bearer a"},
-                "refreshToken": {"token": "Bearer r"},
-            },
-        })
+        mock_urlopen.return_value = _mock_urlopen(
+            {
+                "code": 200,
+                "data": {
+                    "accessToken": {"token": "Bearer a"},
+                    "refreshToken": {"token": "Bearer r"},
+                },
+            }
+        )
         refresh_token("Bearer tok", "Bearer rt_val", region="us")
         req = mock_urlopen.call_args[0][0]
         assert req.method == "PUT"
@@ -258,6 +266,7 @@ class TestRefreshToken:
 # get_device_attributes()
 # ---------------------------------------------------------------------------
 
+
 class TestGetDeviceAttributes:
     @patch("landbook_api.api.urllib.request.urlopen")
     def test_returns_data(self, mock_urlopen):
@@ -278,18 +287,21 @@ class TestGetDeviceAttributes:
 # Async wrappers
 # ---------------------------------------------------------------------------
 
+
 class TestAsyncWrappers:
     @patch("landbook_api.api.urllib.request.urlopen")
     def test_async_login(self, mock_urlopen):
         token = _fake_jwt("u1")
-        mock_urlopen.return_value = _mock_urlopen({
-            "code": 200,
-            "data": {
-                "accessToken": {"token": token},
-                "refreshToken": {"token": "Bearer r"},
-            },
-        })
-        bearer, uid, rt = asyncio.get_event_loop().run_until_complete(
+        mock_urlopen.return_value = _mock_urlopen(
+            {
+                "code": 200,
+                "data": {
+                    "accessToken": {"token": token},
+                    "refreshToken": {"token": "Bearer r"},
+                },
+            }
+        )
+        _bearer, uid, _rt = asyncio.get_event_loop().run_until_complete(
             async_login("a@b.com", "pass")
         )
         assert uid == "u1"
@@ -297,30 +309,28 @@ class TestAsyncWrappers:
     @patch("landbook_api.api.urllib.request.urlopen")
     def test_async_get_device_list(self, mock_urlopen):
         mock_urlopen.return_value = _mock_urlopen({"code": 200, "data": {"list": [{"id": 1}]}})
-        result = asyncio.get_event_loop().run_until_complete(
-            async_get_device_list("Bearer tok")
-        )
+        result = asyncio.get_event_loop().run_until_complete(async_get_device_list("Bearer tok"))
         assert result == [{"id": 1}]
 
     @patch("landbook_api.api.urllib.request.urlopen")
     def test_async_get_tsl(self, mock_urlopen):
         props = [{"code": "a", "type": "PROPERTY", "subType": "W", "sort": 0}]
         mock_urlopen.return_value = _mock_urlopen({"code": 200, "data": {"properties": props}})
-        result = asyncio.get_event_loop().run_until_complete(
-            async_get_tsl("Bearer tok", "pk1")
-        )
+        result = asyncio.get_event_loop().run_until_complete(async_get_tsl("Bearer tok", "pk1"))
         assert len(result) == 1
 
     @patch("landbook_api.api.urllib.request.urlopen")
     def test_async_refresh_token(self, mock_urlopen):
-        mock_urlopen.return_value = _mock_urlopen({
-            "code": 200,
-            "data": {
-                "accessToken": {"token": "Bearer a2"},
-                "refreshToken": {"token": "Bearer r2"},
-            },
-        })
-        a, r = asyncio.get_event_loop().run_until_complete(
+        mock_urlopen.return_value = _mock_urlopen(
+            {
+                "code": 200,
+                "data": {
+                    "accessToken": {"token": "Bearer a2"},
+                    "refreshToken": {"token": "Bearer r2"},
+                },
+            }
+        )
+        a, _r = asyncio.get_event_loop().run_until_complete(
             async_refresh_token("Bearer a", "Bearer r")
         )
         assert a == "Bearer a2"
