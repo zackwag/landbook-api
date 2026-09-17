@@ -1,9 +1,9 @@
 import json
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from landbook_api import LandbookMQTTClient, DEFAULT_REGION, REGIONS
+from landbook_api import DEFAULT_REGION, REGIONS, LandbookMQTTClient
 from landbook_api.mqtt_client import WRITE_RETRY_WINDOW
 
 

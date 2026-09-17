@@ -29,8 +29,10 @@ properties = get_tsl(bearer_token, pk, region="us")
 client = LandbookMQTTClient(uid, bearer_token)
 client.connect()
 
+
 def on_message(topic_suffix: str, payload: dict) -> None:
     print(topic_suffix, payload)
+
 
 device_id = f"qd{pk}{dk}"
 client.subscribe_device(device_id, on_message)

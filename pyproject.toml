@@ -32,3 +32,6 @@ test = ["pytest>=7.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["landbook_api"]
+
+[tool.ruff]
+line-length = 100
