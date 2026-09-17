@@ -20,7 +20,7 @@ from .api import (
 from .const import DEFAULT_REGION, REGIONS
 from .mqtt_client import LandbookMQTTClient
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"  # x-release-please-version
 
 __all__ = [
     "LandbookAPIError",
