@@ -138,7 +138,16 @@ class LandbookMQTTClient:
         alone doesn't catch it.
         """
         with self._wire_lock:
-            self._shutting_down = False
+            # Suppress the old client's _on_disconnect from *also* scheduling
+            # a reconnect: disconnect() below fires it (sometimes off-thread,
+            # sometimes synchronously depending on paho's internal state),
+            # and this method already re-establishes the connection itself.
+            # Without this, both the scheduled reconnect and this method's
+            # own self.connect() call go through, producing two live MQTT
+            # sessions for the same account — duplicate subscriptions and
+            # colliding msgIds that the server rejects (SENDACK status:
+            # 'fail' on every command). See landbook-ha#27.
+            self._shutting_down = True
             if self._reconnect_timer:
                 self._reconnect_timer.cancel()
                 self._reconnect_timer = None
@@ -147,7 +156,10 @@ class LandbookMQTTClient:
                 self._client.disconnect()
                 self._client = None
             self._connected = False
-        self.connect()
+        try:
+            self.connect()
+        finally:
+            self._shutting_down = False
 
     def subscribe_device(
         self,
