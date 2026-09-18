@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/zackwag/landbook-api/compare/v0.4.1...v0.4.2) (2026-09-18)
+
+
+### Bug Fixes
+
+* suppress duplicate reconnect from watchdog-triggered reconnect() ([#19](https://github.com/zackwag/landbook-api/issues/19)) ([65d9ce3](https://github.com/zackwag/landbook-api/commit/65d9ce3312d69e03524c8c28181a0d7266766d44))
+
 ## [0.4.1](https://github.com/zackwag/landbook-api/compare/v0.4.0...v0.4.1) (2026-09-17)
 
 
