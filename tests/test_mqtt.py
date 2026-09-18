@@ -353,3 +353,41 @@ class TestReconnect:
         assert client._connected is False
         assert client._shutting_down is False
         mock_connect.assert_called_once()
+
+    def test_old_clients_on_disconnect_does_not_schedule_duplicate_reconnect(self, client):
+        """Regression for landbook-ha#27: reconnect() tearing down the old
+        client can fire that client's on_disconnect (paho may invoke it
+        synchronously from disconnect(), or shortly after from the network
+        thread). That must not ALSO schedule a reconnect on top of the one
+        reconnect() performs itself — doing so opens a second live MQTT
+        session with colliding msgIds, which the server rejects wholesale."""
+        old_mqtt = MagicMock()
+        client._client = old_mqtt
+        client._connected = True
+
+        def fake_disconnect():
+            client._on_disconnect(None, None, None, 1, None)
+
+        old_mqtt.disconnect.side_effect = fake_disconnect
+
+        with (
+            patch.object(LandbookMQTTClient, "connect") as mock_connect,
+            patch.object(LandbookMQTTClient, "_schedule_reconnect") as mock_sched,
+        ):
+            client.reconnect()
+
+        mock_sched.assert_not_called()
+        mock_connect.assert_called_once()
+        assert client._shutting_down is False
+
+    def test_shutting_down_reset_even_if_connect_fails(self, client):
+        client._client = MagicMock()
+        client._connected = True
+
+        with (
+            patch.object(LandbookMQTTClient, "connect", side_effect=ConnectionError("boom")),
+            pytest.raises(ConnectionError),
+        ):
+            client.reconnect()
+
+        assert client._shutting_down is False
