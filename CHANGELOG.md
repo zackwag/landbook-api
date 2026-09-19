@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/zackwag/landbook-api/compare/v0.5.0...v0.6.0) (2026-09-19)
+
+
+### Features
+
+* add on_disconnect callback and is_connected to LandbookLocalClient ([#24](https://github.com/zackwag/landbook-api/issues/24)) ([ef0d7f8](https://github.com/zackwag/landbook-api/commit/ef0d7f828d2ec72e3825d2d8a5c548674607b3b2))
+
 ## [0.5.0](https://github.com/zackwag/landbook-api/compare/v0.4.2...v0.5.0) (2026-09-19)
 
 
