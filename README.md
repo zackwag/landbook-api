@@ -4,6 +4,7 @@ Unofficial Python client for the Landbook smart home cloud API (Netprisma/Landec
 
 - **REST**: email/password login, token refresh, device discovery, TSL (Thing Specification Language) model fetch, device attribute reads.
 - **MQTT**: a persistent WebSocket/TLS pub-sub connection for real-time device control and state (`LandbookMQTTClient`).
+- **Local LAN control**: a direct TCP connection to a device on the local network, bypassing the cloud entirely (`LandbookLocalClient`) — see [LOCAL_CONTROL.md](LOCAL_CONTROL.md).
 
 This library powers the [landbook-ha](https://github.com/zackwag/landbook-ha) Home Assistant integration, but has no dependency on Home Assistant and can be used standalone.
 
