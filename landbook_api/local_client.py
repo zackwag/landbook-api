@@ -25,9 +25,19 @@ Flow:
    string — so `read()`/`write()` and the periodic heartbeat this client
    sends are all opaque on the wire from that point on.
 
-This is unverified against real hardware — reverse-engineered from the
-app's code, not from a packet capture. Treat any failure at connect/login
-time as "the spec may have a bug", not "the device is broken".
+Login (discovery, TCP connect, the SHA-256 challenge-response handshake,
+and the AES key/IV derivation above) has been confirmed end-to-end against
+a real device (a GE OmniBreeze fan, productKey p11vkW). `read()` itself is
+still unconfirmed as doing anything, though: on that same device, the
+properties it asked for never came back as a direct reply. Instead, the
+device continuously and independently pushes one property at a time on
+`CMD_STATUS_PUSH_OBSERVED` (cmd=20) regardless of whether a read was ever
+sent — cycling through its properties on its own schedule. So the working
+model for now is: build a state cache by listening to `on_update` over
+time rather than expecting a synchronous reply to `read()`. Whether cmd 17
+does anything at all (maybe it nudges the push cycle, maybe it's a no-op
+for this product) is still open. `write()` (cmd 19) has not yet been
+tried against real hardware.
 """
 
 from __future__ import annotations
@@ -258,12 +268,22 @@ class LandbookLocalClient:
 
     def read(self, ids: list[int]) -> None:
         """Request the current values of the given property ids (TSL
-        numeric `id`, not `code`)."""
+        numeric `id`, not `code`).
+
+        On real hardware tested so far, this hasn't produced an observable
+        direct reply — properties instead arrive continuously via
+        `on_update` regardless of whether this was called. Kept as a public
+        method since it matches the app's protocol, but don't rely on it
+        actually doing anything yet.
+        """
         self._send(CMD_READ, encode_id_list(ids))
 
     def write(self, fields: list[TTLVField]) -> None:
         """Write property values — build fields with
-        local_protocol.field_for_property()."""
+        local_protocol.field_for_property().
+
+        Not yet tried against real hardware.
+        """
         self._send(CMD_WRITE, encode_fields(fields))
 
     # ------------------------------------------------------------------
