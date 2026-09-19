@@ -50,6 +50,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -232,10 +233,25 @@ class LandbookLocalClient:
 
         self._heartbeat_timer: threading.Timer | None = None
 
+        # Last known value per property (TSL numeric id, not string code),
+        # fed by every status push / read-write response — NOT by
+        # CMD_WRITE_ACK, whose payload doesn't appear to mirror property
+        # state (see _on_write_ack). Populated passively over time by
+        # whatever the device pushes on its own schedule; read_and_wait()
+        # waits on `_property_updated` for ids not yet present.
+        self.properties: dict[int, Any] = {}
+        self._property_updated = threading.Condition()
+
         # Called with the decoded TTLV fields from any read/write response
         # or unsolicited status push. Fields carry the property's numeric
         # TSL id (not its string code) — see local_protocol.field_for_property.
         self.on_update: Callable[[list[TTLVField]], None] | None = None
+
+        # Called with the decoded fields from a CMD_WRITE_ACK reply. Kept
+        # separate from on_update since this payload's meaning is still
+        # unconfirmed (see module docstring) and doesn't belong in the
+        # property cache.
+        self.on_write_ack: Callable[[list[TTLVField]], None] | None = None
 
     def connect(self, timeout: float = LOGIN_TIMEOUT) -> None:
         """Open the TCP connection and complete the login handshake
@@ -272,18 +288,45 @@ class LandbookLocalClient:
                 pass
             self._sock = None
         self._logged_in.clear()
+        with self._property_updated:
+            self._property_updated.notify_all()
 
     def read(self, ids: list[int]) -> None:
         """Request the current values of the given property ids (TSL
-        numeric `id`, not `code`).
+        numeric `id`, not `code`) — fire-and-forget, matching the app's
+        protocol.
 
-        On real hardware tested so far, this hasn't produced an observable
-        direct reply — properties instead arrive continuously via
-        `on_update` regardless of whether this was called. Kept as a public
-        method since it matches the app's protocol, but don't rely on it
-        actually doing anything yet.
+        On real hardware tested so far, this alone hasn't produced an
+        observable direct reply: the device pushes its properties
+        continuously and on its own schedule via `on_update`/`properties`
+        regardless of whether this was called. If you actually need
+        current values rather than just triggering the request, use
+        `read_and_wait()` instead.
         """
         self._send(CMD_READ, encode_id_list(ids))
+
+    def read_and_wait(self, ids: list[int], timeout: float = 10.0) -> dict[int, Any]:
+        """Send a read request, then wait for the given property ids to
+        show up in `self.properties` (populated passively from whatever
+        the device pushes on its own — see `read()`'s docstring), up to
+        `timeout` seconds.
+
+        Returns whatever is known for the requested ids once all of them
+        are present, or a partial (possibly empty) result if `timeout`
+        elapses first — this never raises on timeout, since "some
+        properties arrived, some haven't yet" is the expected steady state
+        for a device that reports asynchronously rather than replying
+        synchronously.
+        """
+        self.read(ids)
+        deadline = time.monotonic() + timeout
+        with self._property_updated:
+            while not all(i in self.properties for i in ids):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._property_updated.wait(timeout=remaining)
+            return {i: self.properties[i] for i in ids if i in self.properties}
 
     def write(self, fields: list[TTLVField]) -> None:
         """Write property values — build fields with
@@ -353,13 +396,10 @@ class LandbookLocalClient:
             self._on_random_reply(frame.payload)
         elif frame.cmd == CMD_LOGIN_RESULT:
             self._on_login_result(frame.payload)
-        elif frame.cmd in (
-            CMD_READ_WRITE_RESP,
-            CMD_STATUS_PUSH,
-            CMD_STATUS_PUSH_OBSERVED,
-            CMD_WRITE_ACK,
-        ):
+        elif frame.cmd in (CMD_READ_WRITE_RESP, CMD_STATUS_PUSH, CMD_STATUS_PUSH_OBSERVED):
             self._on_data(frame.payload)
+        elif frame.cmd == CMD_WRITE_ACK:
+            self._on_write_ack(frame.payload)
         else:
             # Other cmds (wifi-list management, etc.) are part of the wider
             # protocol but not needed for property read/write. Opportunistically
@@ -421,29 +461,45 @@ class LandbookLocalClient:
         self._logged_in.set()
         self._send_heartbeat()
 
-    def _on_data(self, payload: bytes) -> None:
+    def _decrypt_and_decode(self, payload: bytes, what: str) -> list[TTLVField] | None:
         raw = payload
         if self._cipher_key is not None:
             try:
                 payload = self._decrypt(payload)
             except ValueError as exc:
                 _LOGGER.warning(
-                    "Landbook local: failed to decrypt incoming frame (%s), raw payload: %s",
+                    "Landbook local: failed to decrypt %s (%s), raw payload: %s",
+                    what,
                     exc,
                     raw.hex(),
                 )
-                return
+                return None
         try:
-            fields = decode_fields(payload)
+            return decode_fields(payload)
         except ProtocolError as exc:
             _LOGGER.warning(
-                "Landbook local: malformed data frame (%s), decrypted payload: %s",
-                exc,
-                payload.hex(),
+                "Landbook local: malformed %s (%s), decrypted payload: %s", what, exc, payload.hex()
             )
+            return None
+
+    def _on_data(self, payload: bytes) -> None:
+        fields = self._decrypt_and_decode(payload, "data frame")
+        if fields is None:
             return
+        with self._property_updated:
+            for f in fields:
+                self.properties[f.id] = f.value
+            self._property_updated.notify_all()
         if self.on_update:
             self.on_update(fields)
+
+    def _on_write_ack(self, payload: bytes) -> None:
+        fields = self._decrypt_and_decode(payload, "write ack")
+        if fields is None:
+            return
+        _LOGGER.debug("Landbook local: write ack: %s", fields)
+        if self.on_write_ack:
+            self.on_write_ack(fields)
 
     def _send_heartbeat(self) -> None:
         if self._shutting_down:
