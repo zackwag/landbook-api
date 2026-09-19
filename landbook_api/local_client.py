@@ -71,6 +71,11 @@ CMD_READ = 17
 CMD_WRITE = 19
 CMD_READ_WRITE_RESP = 18
 CMD_STATUS_PUSH = 50
+# Observed on a real device (GE OmniBreeze fan, p11vkW) as a continuous,
+# unsolicited push independent of any read/write request — the app's
+# decompiled dispatch never named this cmd, so CMD_STATUS_PUSH=50 above may
+# be wrong, unused by this product, or just one of several status cmds.
+CMD_STATUS_PUSH_OBSERVED = 20
 CMD_HEARTBEAT = 28729
 
 LOGIN_TIMEOUT = 10.0
@@ -319,13 +324,32 @@ class LandbookLocalClient:
             self._on_random_reply(frame.payload)
         elif frame.cmd == CMD_LOGIN_RESULT:
             self._on_login_result(frame.payload)
-        elif frame.cmd in (CMD_READ_WRITE_RESP, CMD_STATUS_PUSH):
+        elif frame.cmd in (CMD_READ_WRITE_RESP, CMD_STATUS_PUSH, CMD_STATUS_PUSH_OBSERVED):
             self._on_data(frame.payload)
         else:
             # Other cmds (wifi-list management, etc.) are part of the wider
-            # protocol but not needed for property read/write — logged so an
-            # unexpected response cmd is visible rather than silently dropped.
-            _LOGGER.debug("Landbook local: unhandled cmd=%s, ignoring", frame.cmd)
+            # protocol but not needed for property read/write. Opportunistically
+            # try to decrypt/decode anyway and log the result — exploratory,
+            # while we're still confirming which cmd numbers this product
+            # actually uses for what.
+            self._try_decode_unknown(frame.cmd, frame.payload)
+
+    def _try_decode_unknown(self, cmd: int, payload: bytes) -> None:
+        if self._cipher_key is None:
+            _LOGGER.debug("Landbook local: unhandled cmd=%s (pre-auth), ignoring", cmd)
+            return
+        try:
+            decrypted = self._decrypt(payload)
+            fields = decode_fields(decrypted)
+        except (ValueError, ProtocolError) as exc:
+            _LOGGER.debug(
+                "Landbook local: unhandled cmd=%s, decode failed (%s), raw payload: %s",
+                cmd,
+                exc,
+                payload.hex(),
+            )
+            return
+        _LOGGER.debug("Landbook local: unhandled cmd=%s decoded successfully: %s", cmd, fields)
 
     def _on_random_reply(self, payload: bytes) -> None:
         try:
