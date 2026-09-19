@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/zackwag/landbook-api/compare/v0.4.2...v0.5.0) (2026-09-19)
+
+
+### Features
+
+* add local-LAN device control as an alternative to cloud MQTT ([#21](https://github.com/zackwag/landbook-api/issues/21)) ([e02b465](https://github.com/zackwag/landbook-api/commit/e02b46557ee787401e99b677240247e0f854e823))
+
 ## [0.4.2](https://github.com/zackwag/landbook-api/compare/v0.4.1...v0.4.2) (2026-09-18)
 
 
