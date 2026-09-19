@@ -113,11 +113,21 @@ def discover_devices(timeout: float = 5.0) -> list[DiscoveredDevice]:
 
     deadline = time.monotonic() + timeout
     next_send = 0.0
+    broadcast_failed = False
     try:
         while time.monotonic() < deadline:
             now = time.monotonic()
             if now >= next_send:
-                sock.sendto(probe, ("255.255.255.255", DISCOVERY_PORT))
+                try:
+                    sock.sendto(probe, ("255.255.255.255", DISCOVERY_PORT))
+                except OSError as exc:
+                    # No active broadcast-capable interface (offline, VPN-only
+                    # routing, a sandboxed environment, ...) — keep listening
+                    # in case a reply arrives anyway, and retry sending on the
+                    # next interval rather than aborting discovery outright.
+                    if not broadcast_failed:
+                        _LOGGER.warning("Landbook local: discovery broadcast failed: %s", exc)
+                        broadcast_failed = True
                 next_send = now + DISCOVERY_PROBE_INTERVAL
             try:
                 data, _addr = sock.recvfrom(2048)
@@ -296,6 +306,12 @@ class LandbookLocalClient:
                 _LOGGER.warning("Landbook local: dropping malformed frame: %s", exc)
                 continue
             for frame in frames:
+                _LOGGER.debug(
+                    "Landbook local: recv cmd=%s packet_id=%s payload_len=%d",
+                    frame.cmd,
+                    frame.packet_id,
+                    len(frame.payload),
+                )
                 self._handle_frame(frame)
 
     def _handle_frame(self, frame: DecodedFrame) -> None:
@@ -305,8 +321,11 @@ class LandbookLocalClient:
             self._on_login_result(frame.payload)
         elif frame.cmd in (CMD_READ_WRITE_RESP, CMD_STATUS_PUSH):
             self._on_data(frame.payload)
-        # Other cmds (wifi-list management, etc.) are part of the wider
-        # protocol but not needed for property read/write — ignored.
+        else:
+            # Other cmds (wifi-list management, etc.) are part of the wider
+            # protocol but not needed for property read/write — logged so an
+            # unexpected response cmd is visible rather than silently dropped.
+            _LOGGER.debug("Landbook local: unhandled cmd=%s, ignoring", frame.cmd)
 
     def _on_random_reply(self, payload: bytes) -> None:
         try:
@@ -345,16 +364,25 @@ class LandbookLocalClient:
         self._send_heartbeat()
 
     def _on_data(self, payload: bytes) -> None:
+        raw = payload
         if self._cipher_key is not None:
             try:
                 payload = self._decrypt(payload)
-            except ValueError:
-                _LOGGER.warning("Landbook local: failed to decrypt incoming frame")
+            except ValueError as exc:
+                _LOGGER.warning(
+                    "Landbook local: failed to decrypt incoming frame (%s), raw payload: %s",
+                    exc,
+                    raw.hex(),
+                )
                 return
         try:
             fields = decode_fields(payload)
-        except ProtocolError:
-            _LOGGER.warning("Landbook local: malformed data frame")
+        except ProtocolError as exc:
+            _LOGGER.warning(
+                "Landbook local: malformed data frame (%s), decrypted payload: %s",
+                exc,
+                payload.hex(),
+            )
             return
         if self.on_update:
             self.on_update(fields)
