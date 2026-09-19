@@ -156,6 +156,22 @@ class TestFieldForProperty:
         with pytest.raises(ProtocolError):
             field_for_property(1, "9", [1, 2])
 
+    def test_named_datatypes_from_real_api(self):
+        # The real userDeviceList/productTSL responses use these human-
+        # readable names, confirmed against a real device — not the
+        # numeric-string codes above, which are the app's internal
+        # convention only.
+        assert field_for_property(1, "BOOL", True) == TTLVField(1, TYPE_BOOL_TRUE, None)
+        assert field_for_property(1, "BOOL", False) == TTLVField(1, TYPE_BOOL_FALSE, None)
+        assert field_for_property(2, "ENUM", 3) == TTLVField(2, TYPE_NUMBER, 3)
+        assert field_for_property(3, "INT", 5) == TTLVField(3, TYPE_NUMBER, 5)
+        assert field_for_property(1, "TEXT", "on") == TTLVField(1, TYPE_BYTES, "on")
+        assert field_for_property(1, "RAW", b"\xff") == TTLVField(1, TYPE_RAW_HEX, b"\xff")
+
+    def test_named_datatype_case_insensitive(self):
+        assert field_for_property(1, "bool", True) == TTLVField(1, TYPE_BOOL_TRUE, None)
+        assert field_for_property(1, "Enum", 2) == TTLVField(1, TYPE_NUMBER, 2)
+
 
 class TestFrameRoundTrip:
     def test_basic_frame(self):

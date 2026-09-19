@@ -106,11 +106,39 @@ _DATATYPE_TO_TTLV_TYPE = {
     "11": TYPE_RAW_HEX,
 }
 
+# The real userDeviceList/productTSL REST responses use human-readable
+# dataType names (confirmed against a real device: "BOOL", "ENUM", "INT"),
+# not the short numeric-string codes above — those numeric codes are an
+# internal convention the app's local-protocol dispatch normalizes named
+# types down to before it ever reaches the TTLV encoder (its cloud-JSON
+# path accepts both forms interchangeably, e.g.
+# `dataType.equalsIgnoreCase("2") || dataType.equalsIgnoreCase("INT")`).
+# Accept either form here too, case-insensitively.
+_DATATYPE_NAME_TO_CODE = {
+    "BOOL": "1",
+    "INT": "2",
+    "FLOAT": "3",
+    "DOUBLE": "4",
+    "ENUM": "5",
+    "TEXT": "6",
+    "DATE": "7",
+    "STRUCT": "8",
+    "ARRAY": "9",
+    "RAW": "11",
+}
+
+
+def _normalize_data_type(data_type: str) -> str:
+    return _DATATYPE_NAME_TO_CODE.get(data_type.upper(), data_type)
+
 
 def field_for_property(prop_id: int, data_type: str, value: Any) -> TTLVField:
     """Build a TTLVField for a TSL property's numeric `id` (NOT its string
-    `code` — that's only used by the cloud MQTT JSON protocol), `dataType`,
-    and current value."""
+    `code` — that's only used by the cloud MQTT JSON protocol), `dataType`
+    (either form — "BOOL"/"ENUM"/"INT"/... as the real API returns it, or
+    the internal "1"/"5"/"2"/... numeric-string codes), and current value.
+    """
+    data_type = _normalize_data_type(data_type)
     if data_type == "1":
         return TTLVField(prop_id, TYPE_BOOL_TRUE if value else TYPE_BOOL_FALSE, None)
     ttlv_type = _DATATYPE_TO_TTLV_TYPE.get(data_type)
