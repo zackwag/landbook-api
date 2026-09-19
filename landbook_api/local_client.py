@@ -253,6 +253,21 @@ class LandbookLocalClient:
         # property cache.
         self.on_write_ack: Callable[[list[TTLVField]], None] | None = None
 
+        # Called with no arguments when the connection is lost
+        # unexpectedly — a broken socket, or the device closing its end —
+        # as opposed to a clean, caller-initiated disconnect(), which never
+        # calls this. See _recv_loop.
+        self.on_disconnect: Callable[[], None] | None = None
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether the local TCP connection is currently up and logged in.
+        Complements on_disconnect for a polling-style check (e.g. a
+        periodic device-availability refresh) rather than only an
+        event-driven one.
+        """
+        return self._sock is not None and self._logged_in.is_set() and not self._shutting_down
+
     def connect(self, timeout: float = LOGIN_TIMEOUT) -> None:
         """Open the TCP connection and complete the login handshake
         (blocking until logged in, login is rejected, or `timeout` elapses).
@@ -390,6 +405,12 @@ class LandbookLocalClient:
                     len(frame.payload),
                 )
                 self._handle_frame(frame)
+        # Only an unexpected exit (broken socket, or the device closing its
+        # end) gets here with _shutting_down still False — a caller-driven
+        # disconnect() sets it before touching the socket, so the loop
+        # condition itself ends things cleanly with nothing to report.
+        if not self._shutting_down and self.on_disconnect:
+            self.on_disconnect()
 
     def _handle_frame(self, frame: DecodedFrame) -> None:
         if frame.cmd == CMD_RANDOM_REPLY:

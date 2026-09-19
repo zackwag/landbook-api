@@ -52,6 +52,7 @@ match = next(d for d in found if d.product_key == pk and d.device_key == dk)
 
 client = LandbookLocalClient(pk, dk, auth_key, match.ip, match.port)
 client.on_update = lambda fields: print("update:", fields)
+client.on_disconnect = lambda: print("connection lost unexpectedly")
 client.connect()  # raises ConnectionError on timeout or a rejected login
 
 # TSL properties carry both a string `code` (used by the cloud MQTT/JSON
@@ -66,6 +67,8 @@ print(values)  # {property_id: value, ...} — partial if not everything arrived
 
 client.disconnect()
 ```
+
+`on_disconnect` fires only when the connection drops unexpectedly (a broken socket, or the device closing its end) — a caller-initiated `disconnect()` never triggers it. `client.is_connected` is the polling-style equivalent, for a periodic check rather than an event callback.
 
 ## Things learned from real hardware that aren't obvious from the protocol alone
 

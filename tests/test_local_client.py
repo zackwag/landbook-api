@@ -1,6 +1,7 @@
 import base64
 import threading
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -141,3 +142,69 @@ class TestStatusPushCmdRecognized:
         # cmd=20, observed as a continuous unsolicited push on a real
         # GE OmniBreeze fan (p11vkW) — see local_client's module docstring.
         assert CMD_STATUS_PUSH_OBSERVED == 20
+
+
+class TestDisconnectDetection:
+    def test_on_disconnect_fires_on_broken_socket(self, client):
+        fired = []
+        client.on_disconnect = lambda: fired.append(True)
+        mock_sock = MagicMock()
+        mock_sock.recv.side_effect = OSError("connection reset")
+        client._sock = mock_sock
+
+        client._recv_loop()
+
+        assert fired == [True]
+
+    def test_on_disconnect_fires_when_remote_closes_cleanly(self, client):
+        fired = []
+        client.on_disconnect = lambda: fired.append(True)
+        mock_sock = MagicMock()
+        mock_sock.recv.return_value = b""  # empty read = remote closed
+        client._sock = mock_sock
+
+        client._recv_loop()
+
+        assert fired == [True]
+
+    def test_on_disconnect_not_fired_for_caller_initiated_disconnect(self, client):
+        """disconnect() sets _shutting_down before touching the socket —
+        _recv_loop must recognize that as a clean, expected exit and not
+        report it as a surprise disconnection."""
+        fired = []
+        client.on_disconnect = lambda: fired.append(True)
+        client._shutting_down = True
+        mock_sock = MagicMock()
+        mock_sock.recv.side_effect = OSError("bad file descriptor")
+        client._sock = mock_sock
+
+        client._recv_loop()
+
+        assert fired == []
+
+    def test_missing_on_disconnect_callback_does_not_raise(self, client):
+        mock_sock = MagicMock()
+        mock_sock.recv.side_effect = OSError("connection reset")
+        client._sock = mock_sock
+
+        client._recv_loop()  # must not raise with on_disconnect left unset
+
+
+class TestIsConnected:
+    def test_false_before_connecting(self, client):
+        assert client.is_connected is False
+
+    def test_true_once_socket_open_and_logged_in(self, client):
+        client._sock = MagicMock()
+        client._logged_in.set()
+        assert client.is_connected is True
+
+    def test_false_while_logged_in_flag_not_yet_set(self, client):
+        client._sock = MagicMock()
+        assert client.is_connected is False
+
+    def test_false_after_disconnect(self, client):
+        client._sock = MagicMock()
+        client._logged_in.set()
+        client.disconnect()
+        assert client.is_connected is False
