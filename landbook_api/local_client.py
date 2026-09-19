@@ -25,19 +25,19 @@ Flow:
    string — so `read()`/`write()` and the periodic heartbeat this client
    sends are all opaque on the wire from that point on.
 
-Login (discovery, TCP connect, the SHA-256 challenge-response handshake,
-and the AES key/IV derivation above) has been confirmed end-to-end against
-a real device (a GE OmniBreeze fan, productKey p11vkW). `read()` itself is
-still unconfirmed as doing anything, though: on that same device, the
-properties it asked for never came back as a direct reply. Instead, the
-device continuously and independently pushes one property at a time on
-`CMD_STATUS_PUSH_OBSERVED` (cmd=20) regardless of whether a read was ever
-sent — cycling through its properties on its own schedule. So the working
-model for now is: build a state cache by listening to `on_update` over
-time rather than expecting a synchronous reply to `read()`. Whether cmd 17
-does anything at all (maybe it nudges the push cycle, maybe it's a no-op
-for this product) is still open. `write()` (cmd 19) has not yet been
-tried against real hardware.
+Confirmed end-to-end against a real device (a GE OmniBreeze fan, productKey
+p11vkW): discovery, the SHA-256 challenge-response login, AES key/IV
+derivation, and `write()` — a bool write to property id=1 visibly turned
+the fan on in the Landbook app. `read()` is still unconfirmed as doing
+anything, though: on that same device, the properties it asked for never
+came back as a direct reply. Instead, the device continuously and
+independently pushes one property at a time on `CMD_STATUS_PUSH_OBSERVED`
+(cmd=20) regardless of whether a read was ever sent — cycling through its
+properties on its own schedule. So the working model for now is: build a
+state cache by listening to `on_update` over time rather than expecting a
+synchronous reply to `read()`. Whether cmd 17 does anything at all (maybe
+it nudges the push cycle, maybe it's a no-op for this product) is still
+open.
 """
 
 from __future__ import annotations
@@ -86,6 +86,13 @@ CMD_STATUS_PUSH = 50
 # decompiled dispatch never named this cmd, so CMD_STATUS_PUSH=50 above may
 # be wrong, unused by this product, or just one of several status cmds.
 CMD_STATUS_PUSH_OBSERVED = 20
+# Observed as the immediate reply to a write() on the same real device — the
+# app names this "CMD_TLS_WRITE_RES" in its logging. Its payload doesn't
+# obviously mirror the written value (a bool write got back a numeric field
+# reading 0), so its exact meaning (success/fail code? something else?) is
+# still unconfirmed — decoded and surfaced via on_update like any other
+# data for now.
+CMD_WRITE_ACK = 28726
 CMD_HEARTBEAT = 28729
 
 LOGIN_TIMEOUT = 10.0
@@ -282,7 +289,9 @@ class LandbookLocalClient:
         """Write property values — build fields with
         local_protocol.field_for_property().
 
-        Not yet tried against real hardware.
+        Confirmed working against real hardware: a bool write visibly
+        turned a fan on. The device replies with CMD_WRITE_ACK; its
+        payload's exact meaning is still unconfirmed (see module docstring).
         """
         self._send(CMD_WRITE, encode_fields(fields))
 
@@ -344,7 +353,12 @@ class LandbookLocalClient:
             self._on_random_reply(frame.payload)
         elif frame.cmd == CMD_LOGIN_RESULT:
             self._on_login_result(frame.payload)
-        elif frame.cmd in (CMD_READ_WRITE_RESP, CMD_STATUS_PUSH, CMD_STATUS_PUSH_OBSERVED):
+        elif frame.cmd in (
+            CMD_READ_WRITE_RESP,
+            CMD_STATUS_PUSH,
+            CMD_STATUS_PUSH_OBSERVED,
+            CMD_WRITE_ACK,
+        ):
             self._on_data(frame.payload)
         else:
             # Other cmds (wifi-list management, etc.) are part of the wider
