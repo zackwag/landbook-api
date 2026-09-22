@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/zackwag/landbook-api/compare/v0.6.0...v0.7.0) (2026-09-22)
+
+
+### Features
+
+* detect heartbeat pong timeout and fire on_disconnect ([#26](https://github.com/zackwag/landbook-api/issues/26)) ([4d12b61](https://github.com/zackwag/landbook-api/commit/4d12b61ecdbe3c1dc44f14be15e81a39db85fe4d))
+
 ## [0.6.0](https://github.com/zackwag/landbook-api/compare/v0.5.0...v0.6.0) (2026-09-19)
 
 
