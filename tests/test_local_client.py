@@ -6,7 +6,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from landbook_api.local_client import (
+    CMD_HEARTBEAT_PING,
     CMD_HEARTBEAT_REPLY,
+    CMD_HEARTBEAT_START,
     CMD_STATUS_PUSH_OBSERVED,
     HEARTBEAT_PONG_TIMEOUT,
     LandbookLocalClient,
@@ -221,23 +223,25 @@ class TestHeartbeatPongTimeout:
             client._handle_frame(frame)
         assert client._last_pong == 200.0
 
-    def test_heartbeat_reply_constant(self):
+    def test_heartbeat_constants(self):
+        assert CMD_HEARTBEAT_START == 28729
+        assert CMD_HEARTBEAT_PING == 28727
         assert CMD_HEARTBEAT_REPLY == 28728
 
     def test_pong_timeout_constant(self):
         assert HEARTBEAT_PONG_TIMEOUT == 30.0
 
-    def test_send_heartbeat_fires_normally_when_pong_fresh(self, client):
+    def test_send_heartbeat_sends_ping_cmd_with_empty_payload(self, client):
         client._sock = MagicMock()
         client._cipher_key = b"0123456789abcdef"
         client._cipher_iv = b"0123456789abcdef"
         sent = []
-        client._send = lambda cmd, payload: sent.append(cmd)
+        client._send = lambda cmd, payload: sent.append((cmd, payload))
         with patch("landbook_api.local_client.time") as mock_time:
             mock_time.monotonic.return_value = 100.0
             client._last_pong = 90.0
             client._send_heartbeat()
-        assert len(sent) == 1
+        assert sent == [(CMD_HEARTBEAT_PING, b"")]
         assert client._heartbeat_timer is not None
         client._heartbeat_timer.cancel()
 
@@ -274,12 +278,15 @@ class TestHeartbeatPongTimeout:
     def test_last_pong_initialized_on_login(self, client):
         assert client._last_pong == 0.0
         client._sock = MagicMock()
-        client._send = lambda *a, **kw: None
+        sent = []
+        client._send = lambda cmd, payload: sent.append((cmd, payload))
         client._random_challenge = "abcdefghijklmnop"
         with patch("landbook_api.local_client.time") as mock_time:
             mock_time.monotonic.return_value = 999.0
             login_payload = encode_fields([TTLVField(3, TYPE_NUMBER, 0)])
             client._on_login_result(login_payload)
         assert client._last_pong == 999.0
+        assert sent[0][0] == CMD_HEARTBEAT_START
+        assert sent[0][1] != b""
         if client._heartbeat_timer:
             client._heartbeat_timer.cancel()
