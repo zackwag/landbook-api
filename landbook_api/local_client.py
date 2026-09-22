@@ -94,14 +94,14 @@ CMD_STATUS_PUSH_OBSERVED = 20
 # still unconfirmed — decoded and surfaced via on_update like any other
 # data for now.
 CMD_WRITE_ACK = 28726
-CMD_HEARTBEAT = 28729
+CMD_HEARTBEAT_PING = 28727
+CMD_HEARTBEAT_START = 28729
 CMD_HEARTBEAT_REPLY = 28728
 
 LOGIN_TIMEOUT = 10.0
-# The app's heartbeat payload requests a 30s interval (TTLV id=1 -> 30); we
-# send at half that for margin. Unconfirmed against real hardware — if the
-# device drops the connection despite heartbeats, this is the first place
-# to look.
+# The app sends CMD_HEARTBEAT_START with a 30s interval request, then pings
+# every 10s. We ping at 15s — close enough for the 30s pong timeout while
+# leaving margin for timer jitter.
 HEARTBEAT_INTERVAL = 15.0
 # If no heartbeat reply arrives within this window, treat the connection as
 # dead and fire on_disconnect. Matches the Landbook app's 30s pong timeout
@@ -489,7 +489,11 @@ class LandbookLocalClient:
         self._cipher_iv = self._random_challenge.encode("utf-8")
         self._last_pong = time.monotonic()
         self._logged_in.set()
-        self._send_heartbeat()
+        self._send(
+            CMD_HEARTBEAT_START,
+            encode_fields([TTLVField(1, TYPE_NUMBER, 30), TTLVField(2, TYPE_NUMBER, 1)]),
+        )
+        self._schedule_heartbeat()
 
     def _decrypt_and_decode(self, payload: bytes, what: str) -> list[TTLVField] | None:
         raw = payload
@@ -541,10 +545,10 @@ class LandbookLocalClient:
             )
             self._force_disconnect()
             return
-        self._send(
-            CMD_HEARTBEAT,
-            encode_fields([TTLVField(1, TYPE_NUMBER, 30), TTLVField(2, TYPE_NUMBER, 1)]),
-        )
+        self._send(CMD_HEARTBEAT_PING, b"")
+        self._schedule_heartbeat()
+
+    def _schedule_heartbeat(self) -> None:
         self._heartbeat_timer = threading.Timer(HEARTBEAT_INTERVAL, self._send_heartbeat)
         self._heartbeat_timer.daemon = True
         self._heartbeat_timer.start()
