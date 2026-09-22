@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/zackwag/landbook-api/compare/v0.7.1...v0.7.2) (2026-09-22)
+
+
+### Bug Fixes
+
+* detect data-plane stall when heartbeats stay alive but property pushes stop ([#30](https://github.com/zackwag/landbook-api/issues/30)) ([3eec3f6](https://github.com/zackwag/landbook-api/commit/3eec3f60591af5c80b524fc7148f7537e23d0074))
+
 ## [0.7.1](https://github.com/zackwag/landbook-api/compare/v0.7.0...v0.7.1) (2026-09-22)
 
 
