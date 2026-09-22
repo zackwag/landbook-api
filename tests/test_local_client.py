@@ -1,12 +1,14 @@
 import base64
 import threading
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from landbook_api.local_client import (
+    CMD_HEARTBEAT_REPLY,
     CMD_STATUS_PUSH_OBSERVED,
+    HEARTBEAT_PONG_TIMEOUT,
     LandbookLocalClient,
     _parse_discovery_reply,
 )
@@ -208,3 +210,76 @@ class TestIsConnected:
         client._logged_in.set()
         client.disconnect()
         assert client.is_connected is False
+
+
+class TestHeartbeatPongTimeout:
+    def test_heartbeat_reply_updates_last_pong(self, client):
+        client._last_pong = 100.0
+        frame = DecodedFrame(packet_id=1, cmd=CMD_HEARTBEAT_REPLY, payload=b"")
+        with patch("landbook_api.local_client.time") as mock_time:
+            mock_time.monotonic.return_value = 200.0
+            client._handle_frame(frame)
+        assert client._last_pong == 200.0
+
+    def test_heartbeat_reply_constant(self):
+        assert CMD_HEARTBEAT_REPLY == 28728
+
+    def test_pong_timeout_constant(self):
+        assert HEARTBEAT_PONG_TIMEOUT == 30.0
+
+    def test_send_heartbeat_fires_normally_when_pong_fresh(self, client):
+        client._sock = MagicMock()
+        client._cipher_key = b"0123456789abcdef"
+        client._cipher_iv = b"0123456789abcdef"
+        sent = []
+        client._send = lambda cmd, payload: sent.append(cmd)
+        with patch("landbook_api.local_client.time") as mock_time:
+            mock_time.monotonic.return_value = 100.0
+            client._last_pong = 90.0
+            client._send_heartbeat()
+        assert len(sent) == 1
+        assert client._heartbeat_timer is not None
+        client._heartbeat_timer.cancel()
+
+    def test_send_heartbeat_tears_down_on_stale_pong(self, client):
+        client._sock = MagicMock()
+        client._logged_in.set()
+        client._last_pong = 50.0
+        force_called = []
+        client._force_disconnect = lambda: force_called.append(True)
+        with patch("landbook_api.local_client.time") as mock_time:
+            mock_time.monotonic.return_value = 100.0
+            client._send_heartbeat()
+        assert force_called == [True]
+
+    def test_force_disconnect_closes_socket_and_cancels_timer(self, client):
+        mock_sock = MagicMock()
+        client._sock = mock_sock
+        mock_timer = MagicMock()
+        client._heartbeat_timer = mock_timer
+        client._force_disconnect()
+        mock_timer.cancel.assert_called_once()
+        mock_sock.close.assert_called_once()
+        assert client._heartbeat_timer is None
+
+    def test_force_disconnect_triggers_on_disconnect_via_recv_loop(self, client):
+        fired = []
+        client.on_disconnect = lambda: fired.append(True)
+        mock_sock = MagicMock()
+        mock_sock.recv.side_effect = OSError("bad file descriptor")
+        client._sock = mock_sock
+        client._recv_loop()
+        assert fired == [True]
+
+    def test_last_pong_initialized_on_login(self, client):
+        assert client._last_pong == 0.0
+        client._sock = MagicMock()
+        client._send = lambda *a, **kw: None
+        client._random_challenge = "abcdefghijklmnop"
+        with patch("landbook_api.local_client.time") as mock_time:
+            mock_time.monotonic.return_value = 999.0
+            login_payload = encode_fields([TTLVField(3, TYPE_NUMBER, 0)])
+            client._on_login_result(login_payload)
+        assert client._last_pong == 999.0
+        if client._heartbeat_timer:
+            client._heartbeat_timer.cancel()

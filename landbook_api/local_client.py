@@ -95,6 +95,7 @@ CMD_STATUS_PUSH_OBSERVED = 20
 # data for now.
 CMD_WRITE_ACK = 28726
 CMD_HEARTBEAT = 28729
+CMD_HEARTBEAT_REPLY = 28728
 
 LOGIN_TIMEOUT = 10.0
 # The app's heartbeat payload requests a 30s interval (TTLV id=1 -> 30); we
@@ -102,6 +103,10 @@ LOGIN_TIMEOUT = 10.0
 # device drops the connection despite heartbeats, this is the first place
 # to look.
 HEARTBEAT_INTERVAL = 15.0
+# If no heartbeat reply arrives within this window, treat the connection as
+# dead and fire on_disconnect. Matches the Landbook app's 30s pong timeout
+# (decompiled from l94.java / mq0.java in APK v3.7.5).
+HEARTBEAT_PONG_TIMEOUT = 30.0
 
 _PACKET_ID_START = 1000
 _PACKET_ID_WRAP = 65535
@@ -232,6 +237,7 @@ class LandbookLocalClient:
         self._cipher_iv: bytes | None = None
 
         self._heartbeat_timer: threading.Timer | None = None
+        self._last_pong: float = 0.0
 
         # Last known value per property (TSL numeric id, not string code),
         # fed by every status push / read-write response — NOT by
@@ -421,6 +427,8 @@ class LandbookLocalClient:
             self._on_data(frame.payload)
         elif frame.cmd == CMD_WRITE_ACK:
             self._on_write_ack(frame.payload)
+        elif frame.cmd == CMD_HEARTBEAT_REPLY:
+            self._last_pong = time.monotonic()
         else:
             # Other cmds (wifi-list management, etc.) are part of the wider
             # protocol but not needed for property read/write. Opportunistically
@@ -479,6 +487,7 @@ class LandbookLocalClient:
         assert self._random_challenge is not None
         self._cipher_key = self._auth_key
         self._cipher_iv = self._random_challenge.encode("utf-8")
+        self._last_pong = time.monotonic()
         self._logged_in.set()
         self._send_heartbeat()
 
@@ -525,6 +534,13 @@ class LandbookLocalClient:
     def _send_heartbeat(self) -> None:
         if self._shutting_down:
             return
+        if self._last_pong and time.monotonic() - self._last_pong > HEARTBEAT_PONG_TIMEOUT:
+            _LOGGER.warning(
+                "Landbook local: heartbeat pong timeout (no reply in %.0fs), tearing down",
+                time.monotonic() - self._last_pong,
+            )
+            self._force_disconnect()
+            return
         self._send(
             CMD_HEARTBEAT,
             encode_fields([TTLVField(1, TYPE_NUMBER, 30), TTLVField(2, TYPE_NUMBER, 1)]),
@@ -532,3 +548,14 @@ class LandbookLocalClient:
         self._heartbeat_timer = threading.Timer(HEARTBEAT_INTERVAL, self._send_heartbeat)
         self._heartbeat_timer.daemon = True
         self._heartbeat_timer.start()
+
+    def _force_disconnect(self) -> None:
+        """Tear down the socket so _recv_loop exits and fires on_disconnect."""
+        if self._heartbeat_timer:
+            self._heartbeat_timer.cancel()
+            self._heartbeat_timer = None
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
