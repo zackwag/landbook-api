@@ -107,6 +107,12 @@ HEARTBEAT_INTERVAL = 15.0
 # dead and fire on_disconnect. Matches the Landbook app's 30s pong timeout
 # (decompiled from l94.java / mq0.java in APK v3.7.5).
 HEARTBEAT_PONG_TIMEOUT = 30.0
+# If no property data frame (CMD_STATUS_PUSH, CMD_STATUS_PUSH_OBSERVED,
+# CMD_READ_WRITE_RESP) arrives within this window while connected, treat
+# the session as wedged and fire on_disconnect. Covers the "silent but
+# attached" failure mode where heartbeat replies keep flowing but the
+# device stops its spontaneous property-push cycle.
+DATA_STALL_TIMEOUT = 90.0
 
 _PACKET_ID_START = 1000
 _PACKET_ID_WRAP = 65535
@@ -238,6 +244,7 @@ class LandbookLocalClient:
 
         self._heartbeat_timer: threading.Timer | None = None
         self._last_pong: float = 0.0
+        self.last_property_update: float = 0.0
 
         # Last known value per property (TSL numeric id, not string code),
         # fed by every status push / read-write response — NOT by
@@ -488,6 +495,7 @@ class LandbookLocalClient:
         self._cipher_key = self._auth_key
         self._cipher_iv = self._random_challenge.encode("utf-8")
         self._last_pong = time.monotonic()
+        self.last_property_update = time.monotonic()
         self._logged_in.set()
         self._send(
             CMD_HEARTBEAT_START,
@@ -520,6 +528,7 @@ class LandbookLocalClient:
         fields = self._decrypt_and_decode(payload, "data frame")
         if fields is None:
             return
+        self.last_property_update = time.monotonic()
         with self._property_updated:
             for f in fields:
                 self.properties[f.id] = f.value
@@ -542,6 +551,16 @@ class LandbookLocalClient:
             _LOGGER.warning(
                 "Landbook local: heartbeat pong timeout (no reply in %.0fs), tearing down",
                 time.monotonic() - self._last_pong,
+            )
+            self._force_disconnect()
+            return
+        if (
+            self.last_property_update
+            and time.monotonic() - self.last_property_update > DATA_STALL_TIMEOUT
+        ):
+            _LOGGER.warning(
+                "Landbook local: data stall (no property push in %.0fs), tearing down",
+                time.monotonic() - self.last_property_update,
             )
             self._force_disconnect()
             return

@@ -10,6 +10,7 @@ from landbook_api.local_client import (
     CMD_HEARTBEAT_REPLY,
     CMD_HEARTBEAT_START,
     CMD_STATUS_PUSH_OBSERVED,
+    DATA_STALL_TIMEOUT,
     HEARTBEAT_PONG_TIMEOUT,
     LandbookLocalClient,
     _parse_discovery_reply,
@@ -277,6 +278,7 @@ class TestHeartbeatPongTimeout:
 
     def test_last_pong_initialized_on_login(self, client):
         assert client._last_pong == 0.0
+        assert client.last_property_update == 0.0
         client._sock = MagicMock()
         sent = []
         client._send = lambda cmd, payload: sent.append((cmd, payload))
@@ -286,7 +288,71 @@ class TestHeartbeatPongTimeout:
             login_payload = encode_fields([TTLVField(3, TYPE_NUMBER, 0)])
             client._on_login_result(login_payload)
         assert client._last_pong == 999.0
+        assert client.last_property_update == 999.0
         assert sent[0][0] == CMD_HEARTBEAT_START
         assert sent[0][1] != b""
         if client._heartbeat_timer:
             client._heartbeat_timer.cancel()
+
+
+class TestDataStallTimeout:
+    def test_data_stall_constant(self):
+        assert DATA_STALL_TIMEOUT == 90.0
+
+    def test_on_data_updates_last_property_update(self, client):
+        client.last_property_update = 100.0
+        payload = encode_fields([TTLVField(1, TYPE_BOOL_TRUE, True)])
+        with patch("landbook_api.local_client.time") as mock_time:
+            mock_time.monotonic.return_value = 200.0
+            client._on_data(payload)
+        assert client.last_property_update == 200.0
+
+    def test_send_heartbeat_tears_down_on_data_stall(self, client):
+        client._sock = MagicMock()
+        client._last_pong = 90.0
+        client.last_property_update = 5.0
+        force_called = []
+        client._force_disconnect = lambda: force_called.append(True)
+        with patch("landbook_api.local_client.time") as mock_time:
+            mock_time.monotonic.return_value = 100.0
+            client._send_heartbeat()
+        assert force_called == [True]
+
+    def test_send_heartbeat_ok_when_data_recent(self, client):
+        client._sock = MagicMock()
+        sent = []
+        client._send = lambda cmd, payload: sent.append(cmd)
+        with patch("landbook_api.local_client.time") as mock_time:
+            mock_time.monotonic.return_value = 100.0
+            client._last_pong = 90.0
+            client.last_property_update = 90.0
+            client._send_heartbeat()
+        assert len(sent) == 1
+        assert client._heartbeat_timer is not None
+        client._heartbeat_timer.cancel()
+
+    def test_pong_timeout_checked_before_data_stall(self, client):
+        """If both pong and data are stale, pong timeout fires first
+        (it's checked first in _send_heartbeat)."""
+        client._sock = MagicMock()
+        client._last_pong = 5.0
+        client.last_property_update = 5.0
+        force_called = []
+        client._force_disconnect = lambda: force_called.append(True)
+        with patch("landbook_api.local_client.time") as mock_time:
+            mock_time.monotonic.return_value = 100.0
+            client._send_heartbeat()
+        assert force_called == [True]
+
+    def test_data_stall_with_fresh_pong(self, client):
+        """The key scenario: heartbeats answering fine but no property
+        pushes — data stall should fire even though pong is fresh."""
+        client._sock = MagicMock()
+        client._last_pong = 99.0
+        client.last_property_update = 5.0
+        force_called = []
+        client._force_disconnect = lambda: force_called.append(True)
+        with patch("landbook_api.local_client.time") as mock_time:
+            mock_time.monotonic.return_value = 100.0
+            client._send_heartbeat()
+        assert force_called == [True]
