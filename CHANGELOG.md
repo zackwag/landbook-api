@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/zackwag/landbook-api/compare/v0.7.0...v0.7.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* split heartbeat start (28729) from periodic ping (28727) ([#28](https://github.com/zackwag/landbook-api/issues/28)) ([45b1321](https://github.com/zackwag/landbook-api/commit/45b1321e20744bf3fef20f9ba2b7307676f04d8d))
+
 ## [0.7.0](https://github.com/zackwag/landbook-api/compare/v0.6.0...v0.7.0) (2026-09-22)
 
 
