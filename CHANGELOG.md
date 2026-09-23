@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/zackwag/landbook-api/compare/v0.7.2...v0.8.0) (2026-09-23)
+
+
+### Features
+
+* add write_and_wait for confirmed local writes ([#35](https://github.com/zackwag/landbook-api/issues/35)) ([185e285](https://github.com/zackwag/landbook-api/commit/185e285386b6c84ece59ed7aa98d7274cce2ca3c))
+
 ## [0.7.2](https://github.com/zackwag/landbook-api/compare/v0.7.1...v0.7.2) (2026-09-22)
 
 
