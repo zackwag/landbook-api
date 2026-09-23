@@ -272,6 +272,8 @@ class LandbookLocalClient:
         # calls this. See _recv_loop.
         self.on_disconnect: Callable[[], None] | None = None
 
+        self._write_ack_event: threading.Event | None = None
+
     @property
     def is_connected(self) -> bool:
         """Whether the local TCP connection is currently up and logged in.
@@ -365,6 +367,23 @@ class LandbookLocalClient:
         payload's exact meaning is still unconfirmed (see module docstring).
         """
         self._send(CMD_WRITE, encode_fields(fields))
+
+    def write_and_wait(self, fields: list[TTLVField], timeout: float = 2.0) -> bool:
+        """Write property values and wait for the device's CMD_WRITE_ACK.
+
+        Returns True if an ack arrived within *timeout* seconds, False
+        otherwise.  A missing ack means the device either didn't receive
+        the command or is in a half-open state where the socket accepts
+        bytes but the firmware doesn't process them — callers should fall
+        back to an alternative control path (e.g. cloud MQTT).
+        """
+        evt = threading.Event()
+        self._write_ack_event = evt
+        try:
+            self.write(fields)
+            return evt.wait(timeout)
+        finally:
+            self._write_ack_event = None
 
     # ------------------------------------------------------------------
     # Internal
@@ -541,6 +560,9 @@ class LandbookLocalClient:
         if fields is None:
             return
         _LOGGER.debug("Landbook local: write ack: %s", fields)
+        evt = self._write_ack_event
+        if evt is not None:
+            evt.set()
         if self.on_write_ack:
             self.on_write_ack(fields)
 

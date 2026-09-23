@@ -10,6 +10,7 @@ from landbook_api.local_client import (
     CMD_HEARTBEAT_REPLY,
     CMD_HEARTBEAT_START,
     CMD_STATUS_PUSH_OBSERVED,
+    CMD_WRITE_ACK,
     DATA_STALL_TIMEOUT,
     HEARTBEAT_PONG_TIMEOUT,
     LandbookLocalClient,
@@ -356,3 +357,63 @@ class TestDataStallTimeout:
             mock_time.monotonic.return_value = 100.0
             client._send_heartbeat()
         assert force_called == [True]
+
+
+class TestWriteAndWait:
+    def test_returns_true_when_ack_arrives(self, client):
+        client._sock = MagicMock()
+        client._cipher_key = b"0123456789abcdef"
+        client._cipher_iv = b"0123456789abcdef"
+
+        def _send_with_ack(cmd, payload):
+            if cmd == 19:  # CMD_WRITE
+                ack_payload = encode_fields([TTLVField(1, TYPE_NUMBER, 0)])
+                threading.Timer(
+                    0.01, client._on_write_ack, args=[client._encrypt(ack_payload)]
+                ).start()
+
+        client._send = _send_with_ack
+        fields = [TTLVField(1, TYPE_BOOL_TRUE, True)]
+        assert client.write_and_wait(fields, timeout=1.0) is True
+
+    def test_returns_false_on_timeout(self, client):
+        client._sock = MagicMock()
+        client._cipher_key = b"0123456789abcdef"
+        client._cipher_iv = b"0123456789abcdef"
+        client._send = lambda cmd, payload: None
+
+        fields = [TTLVField(1, TYPE_BOOL_TRUE, True)]
+        assert client.write_and_wait(fields, timeout=0.05) is False
+
+    def test_clears_event_after_completion(self, client):
+        client._sock = MagicMock()
+        client._cipher_key = b"0123456789abcdef"
+        client._cipher_iv = b"0123456789abcdef"
+        client._send = lambda cmd, payload: None
+
+        fields = [TTLVField(1, TYPE_BOOL_TRUE, True)]
+        client.write_and_wait(fields, timeout=0.05)
+        assert client._write_ack_event is None
+
+    def test_on_write_ack_callback_still_fires(self, client):
+        client._sock = MagicMock()
+        client._cipher_key = b"0123456789abcdef"
+        client._cipher_iv = b"0123456789abcdef"
+
+        acks = []
+        client.on_write_ack = lambda fields: acks.append(fields)
+
+        def _send_with_ack(cmd, payload):
+            if cmd == 19:
+                ack_payload = encode_fields([TTLVField(1, TYPE_NUMBER, 0)])
+                threading.Timer(
+                    0.01, client._on_write_ack, args=[client._encrypt(ack_payload)]
+                ).start()
+
+        client._send = _send_with_ack
+        fields = [TTLVField(1, TYPE_BOOL_TRUE, True)]
+        client.write_and_wait(fields, timeout=1.0)
+        assert len(acks) == 1
+
+    def test_write_ack_cmd_constant(self):
+        assert CMD_WRITE_ACK == 28726
