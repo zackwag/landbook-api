@@ -99,6 +99,31 @@ class TestSubscribeDevice:
         mock_mqtt.subscribe.assert_not_called()
 
 
+class TestUnsubscribeDevice:
+    def test_removes_callback(self, client):
+        cb = MagicMock()
+        client.subscribe_device("dev1", cb)
+        client.unsubscribe_device("dev1", cb)
+        assert cb not in client._listeners["dev1"]
+
+    def test_leaves_other_callbacks(self, client):
+        cb1, cb2 = MagicMock(), MagicMock()
+        client.subscribe_device("dev1", cb1)
+        client.subscribe_device("dev1", cb2)
+        client.unsubscribe_device("dev1", cb1)
+        assert cb1 not in client._listeners["dev1"]
+        assert cb2 in client._listeners["dev1"]
+
+    def test_unknown_device_is_noop(self, client):
+        client.unsubscribe_device("nonexistent", MagicMock())
+
+    def test_unknown_callback_is_noop(self, client):
+        cb1, cb2 = MagicMock(), MagicMock()
+        client.subscribe_device("dev1", cb1)
+        client.unsubscribe_device("dev1", cb2)
+        assert cb1 in client._listeners["dev1"]
+
+
 class TestSendRead:
     def test_publishes_read_attr(self, client):
         mock_mqtt = MagicMock()

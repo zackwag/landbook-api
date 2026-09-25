@@ -178,6 +178,27 @@ class LandbookMQTTClient:
 
             self._listeners[device_id].append(callback)
 
+    def unsubscribe_device(
+        self,
+        device_id: str,
+        callback: Callable[[str, Any], None],
+    ) -> None:
+        """Remove a previously registered callback for a device.
+
+        If this was the last callback for the device, the MQTT topic
+        subscriptions for that device are left in place (harmless — paho
+        just drops messages with no matching handler) rather than
+        unsubscribing, which avoids a race with an in-flight message on
+        the broker.
+        """
+        with self._wire_lock:
+            cbs = self._listeners.get(device_id)
+            if cbs is not None:
+                try:
+                    cbs.remove(callback)
+                except ValueError:
+                    pass
+
     def send_read(self, device_id: str, pk: str, dk: str, codes: list[str]) -> None:
         """Request current values for the given property codes (READ-ATTR)."""
         with self._wire_lock:
