@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/zackwag/landbook-api/compare/v0.8.0...v0.9.0) (2026-09-25)
+
+
+### Features
+
+* add unsubscribe_device to remove per-device MQTT callbacks ([#37](https://github.com/zackwag/landbook-api/issues/37)) ([aa426ca](https://github.com/zackwag/landbook-api/commit/aa426ca09b3bc9831ceb8cdfe2b0045e16592477))
+
 ## [0.8.0](https://github.com/zackwag/landbook-api/compare/v0.7.2...v0.8.0) (2026-09-23)
 
 
