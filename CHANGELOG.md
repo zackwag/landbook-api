@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0b1] - 2026-11-01
+
+- Fork test release: request fresh status before tearing down a property-silent local session; retain timeout recovery if the probe fails.
+- Add write_and_confirm, requiring fresh matching property values rather than a write ACK or cached value.
+- Empty data frames no longer count as property updates.
+- Hardware validation pending; does not claim to resolve vendor cloud SENDACK failures.
+
 ## [0.9.0](https://github.com/zackwag/landbook-api/compare/v0.8.0...v0.9.0) (2026-09-25)
 
 

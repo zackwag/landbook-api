@@ -113,6 +113,8 @@ HEARTBEAT_PONG_TIMEOUT = 30.0
 # attached" failure mode where heartbeat replies keep flowing but the
 # device stops its spontaneous property-push cycle.
 DATA_STALL_TIMEOUT = 90.0
+# Allow one heartbeat interval for an explicit status probe to produce data.
+DATA_PROBE_TIMEOUT = 15.0
 
 _PACKET_ID_START = 1000
 _PACKET_ID_WRAP = 65535
@@ -245,6 +247,7 @@ class LandbookLocalClient:
         self._heartbeat_timer: threading.Timer | None = None
         self._last_pong: float = 0.0
         self.last_property_update: float = 0.0
+        self._data_probe_started: float | None = None
 
         # Last known value per property (TSL numeric id, not string code),
         # fed by every status push / read-write response — NOT by
@@ -254,6 +257,8 @@ class LandbookLocalClient:
         # waits on `_property_updated` for ids not yet present.
         self.properties: dict[int, Any] = {}
         self._property_updated = threading.Condition()
+        self._property_revision: dict[int, int] = {}
+        self._write_confirmation_lock = threading.Lock()
 
         # Called with the decoded TTLV fields from any read/write response
         # or unsolicited status push. Fields carry the property's numeric
@@ -293,6 +298,9 @@ class LandbookLocalClient:
         self._shutting_down = False
         self._login_failed = False
         self._logged_in.clear()
+        self._data_probe_started = None
+        self.properties.clear()
+        self._property_revision.clear()
 
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._recv_thread.start()
@@ -384,6 +392,35 @@ class LandbookLocalClient:
             return evt.wait(timeout)
         finally:
             self._write_ack_event = None
+
+    def write_and_confirm(self, fields: list[TTLVField], timeout: float = 10.0) -> bool:
+        """Wait for fresh property values matching a write, not merely its ACK.
+
+        Cached values, heartbeat replies and CMD_WRITE_ACK cannot satisfy
+        this check. False means unconfirmed, not necessarily unapplied;
+        callers may retry idempotent property assignments via another path.
+        """
+        if not fields:
+            return False
+        # Normalize booleans (encoded in the TTLV type, often value=None)
+        # and numeric wire precision using the same decoder as device data.
+        expected = {f.id: f.value for f in decode_fields(encode_fields(fields))}
+        with self._write_confirmation_lock, self._property_updated:
+            revisions = {i: self._property_revision.get(i, 0) for i in expected}
+            self.write(fields)
+            self.read(list(expected))
+            deadline = time.monotonic() + timeout
+            while True:
+                if all(
+                    self._property_revision.get(i, 0) > revisions[i]
+                    and self.properties.get(i) == value
+                    for i, value in expected.items()
+                ):
+                    return True
+                remaining = deadline - time.monotonic()
+                if self._shutting_down or self._sock is None or remaining <= 0:
+                    return False
+                self._property_updated.wait(remaining)
 
     # ------------------------------------------------------------------
     # Internal
@@ -545,12 +582,14 @@ class LandbookLocalClient:
 
     def _on_data(self, payload: bytes) -> None:
         fields = self._decrypt_and_decode(payload, "data frame")
-        if fields is None:
+        if not fields:
             return
         self.last_property_update = time.monotonic()
         with self._property_updated:
+            self._data_probe_started = None
             for f in fields:
                 self.properties[f.id] = f.value
+                self._property_revision[f.id] = self._property_revision.get(f.id, 0) + 1
             self._property_updated.notify_all()
         if self.on_update:
             self.on_update(fields)
@@ -580,11 +619,31 @@ class LandbookLocalClient:
             self.last_property_update
             and time.monotonic() - self.last_property_update > DATA_STALL_TIMEOUT
         ):
-            _LOGGER.warning(
-                "Landbook local: data stall (no property push in %.0fs), tearing down",
-                time.monotonic() - self.last_property_update,
-            )
-            self._force_disconnect()
+            # Pongs only prove the heartbeat handler is alive. Ask for real
+            # properties before declaring a quiet data plane wedged. Never
+            # use read_and_wait here: it can immediately return cached data.
+            now = time.monotonic()
+            with self._property_updated:
+                ids = list(self.properties)
+                if self._data_probe_started is None and ids:
+                    self._data_probe_started = now
+                    try:
+                        self.read(ids)
+                    except OSError:
+                        self._force_disconnect()
+                        return
+                    _LOGGER.debug("Landbook local: property silence; requesting fresh status")
+                elif (
+                    not ids
+                    or now - self._data_probe_started >= DATA_PROBE_TIMEOUT
+                ):
+                    _LOGGER.warning(
+                        "Landbook local: data stall; fresh status probe failed, tearing down"
+                    )
+                    self._force_disconnect()
+                    return
+            self._send(CMD_HEARTBEAT_PING, b"")
+            self._schedule_heartbeat()
             return
         self._send(CMD_HEARTBEAT_PING, b"")
         self._schedule_heartbeat()
