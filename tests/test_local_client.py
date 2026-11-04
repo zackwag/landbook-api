@@ -9,8 +9,10 @@ from landbook_api.local_client import (
     CMD_HEARTBEAT_PING,
     CMD_HEARTBEAT_REPLY,
     CMD_HEARTBEAT_START,
+    CMD_READ,
     CMD_STATUS_PUSH_OBSERVED,
     CMD_WRITE_ACK,
+    DATA_PROBE_TIMEOUT,
     DATA_STALL_TIMEOUT,
     HEARTBEAT_PONG_TIMEOUT,
     LandbookLocalClient,
@@ -21,6 +23,7 @@ from landbook_api.local_protocol import (
     TYPE_BYTES,
     TYPE_NUMBER,
     DecodedFrame,
+    FrameDecoder,
     TTLVField,
     encode_fields,
 )
@@ -297,6 +300,65 @@ class TestHeartbeatPongTimeout:
 
 
 class TestDataStallTimeout:
+    def test_quiet_session_probes_before_disconnect_and_fresh_data_recovers(self, client):
+        client._sock = MagicMock()
+        client.properties[1] = True
+        client._last_pong = 99.0
+        client.last_property_update = 5.0
+        with (
+            patch("landbook_api.local_client.time.monotonic", return_value=100.0),
+            patch("landbook_api.local_client.threading.Timer"),
+        ):
+            client._send_heartbeat()
+            frames = FrameDecoder().feed(
+                b"".join(c.args[0] for c in client._sock.sendall.call_args_list)
+            )
+            assert [f.cmd for f in frames] == [CMD_READ, CMD_HEARTBEAT_PING]
+            client._sock.close.assert_not_called()
+            # A new property frame, even with an unchanged value, is fresh evidence.
+            client._on_data(encode_fields([TTLVField(1, TYPE_BOOL_TRUE, True)]))
+            assert client._data_probe_started is None
+            client._send_heartbeat()
+            client._sock.close.assert_not_called()
+
+    @pytest.mark.parametrize("reply", ["pong", "ack", "empty", "malformed"])
+    def test_probe_requires_properties_not_transport_replies(self, client, reply):
+        sock = MagicMock()
+        client._sock = sock
+        client.properties[1] = True
+        client._last_pong = 99.0
+        client.last_property_update = 5.0
+        with (
+            patch("landbook_api.local_client.time.monotonic", return_value=100.0),
+            patch("landbook_api.local_client.threading.Timer"),
+        ):
+            client._send_heartbeat()
+            if reply == "pong":
+                client._handle_frame(DecodedFrame(1, CMD_HEARTBEAT_REPLY, b""))
+            elif reply == "ack":
+                client._on_write_ack(encode_fields([TTLVField(1, TYPE_NUMBER, 0)]))
+            elif reply == "empty":
+                client._on_data(encode_fields([]))
+            else:
+                client._on_data(b"\xff\xff\xff")
+            assert client.last_property_update == 5.0
+        with patch(
+            "landbook_api.local_client.time.monotonic", return_value=100.0 + DATA_PROBE_TIMEOUT
+        ):
+            client._send_heartbeat()
+        sock.close.assert_called_once()
+
+    def test_probe_send_error_disconnects(self, client):
+        sock = MagicMock()
+        sock.sendall.side_effect = OSError("broken pipe")
+        client._sock = sock
+        client.properties[1] = True
+        client._last_pong = 99.0
+        client.last_property_update = 5.0
+        with patch("landbook_api.local_client.time.monotonic", return_value=100.0):
+            client._send_heartbeat()
+        sock.close.assert_called_once()
+
     def test_data_stall_constant(self):
         assert DATA_STALL_TIMEOUT == 90.0
 
@@ -360,6 +422,34 @@ class TestDataStallTimeout:
 
 
 class TestWriteAndWait:
+    @pytest.mark.parametrize("reply", ["match", "wrong", "ack", "unrelated"])
+    def test_write_confirmation_requires_new_matching_properties(self, client, reply):
+        client._sock = MagicMock()
+        client._on_data(encode_fields([TTLVField(1, TYPE_BOOL_TRUE, True)]))
+
+        def receive_after_write(wire):
+            frame = FrameDecoder().feed(wire)[0]
+            if frame.cmd != 19:
+                return
+            if reply == "match":
+                client._on_data(encode_fields([TTLVField(1, TYPE_BOOL_TRUE, None)]))
+            elif reply == "wrong":
+                client._on_data(encode_fields([TTLVField(1, TYPE_NUMBER, 0)]))
+            elif reply == "ack":
+                client._on_write_ack(encode_fields([TTLVField(1, TYPE_NUMBER, 0)]))
+            else:
+                client._on_data(encode_fields([TTLVField(2, TYPE_NUMBER, 5)]))
+
+        client._sock.sendall.side_effect = receive_after_write
+        assert client.write_and_confirm([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=0.01) is (
+            reply == "match"
+        )
+
+    def test_cached_matching_value_does_not_confirm_write(self, client):
+        client._sock = MagicMock()
+        client._on_data(encode_fields([TTLVField(1, TYPE_BOOL_TRUE, True)]))
+        assert not client.write_and_confirm([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=0.01)
+
     def test_returns_true_when_ack_arrives(self, client):
         client._sock = MagicMock()
         client._cipher_key = b"0123456789abcdef"
