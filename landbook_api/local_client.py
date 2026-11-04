@@ -633,10 +633,7 @@ class LandbookLocalClient:
                         self._force_disconnect()
                         return
                     _LOGGER.debug("Landbook local: property silence; requesting fresh status")
-                elif (
-                    not ids
-                    or now - self._data_probe_started >= DATA_PROBE_TIMEOUT
-                ):
+                elif not ids or now - self._data_probe_started >= DATA_PROBE_TIMEOUT:
                     _LOGGER.warning(
                         "Landbook local: data stall; fresh status probe failed, tearing down"
                     )

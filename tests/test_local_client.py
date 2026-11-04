@@ -305,11 +305,14 @@ class TestDataStallTimeout:
         client.properties[1] = True
         client._last_pong = 99.0
         client.last_property_update = 5.0
-        with patch("landbook_api.local_client.time.monotonic", return_value=100.0), patch(
-            "landbook_api.local_client.threading.Timer"
+        with (
+            patch("landbook_api.local_client.time.monotonic", return_value=100.0),
+            patch("landbook_api.local_client.threading.Timer"),
         ):
             client._send_heartbeat()
-            frames = FrameDecoder().feed(b"".join(c.args[0] for c in client._sock.sendall.call_args_list))
+            frames = FrameDecoder().feed(
+                b"".join(c.args[0] for c in client._sock.sendall.call_args_list)
+            )
             assert [f.cmd for f in frames] == [CMD_READ, CMD_HEARTBEAT_PING]
             client._sock.close.assert_not_called()
             # A new property frame, even with an unchanged value, is fresh evidence.
@@ -325,8 +328,9 @@ class TestDataStallTimeout:
         client.properties[1] = True
         client._last_pong = 99.0
         client.last_property_update = 5.0
-        with patch("landbook_api.local_client.time.monotonic", return_value=100.0), patch(
-            "landbook_api.local_client.threading.Timer"
+        with (
+            patch("landbook_api.local_client.time.monotonic", return_value=100.0),
+            patch("landbook_api.local_client.threading.Timer"),
         ):
             client._send_heartbeat()
             if reply == "pong":
@@ -437,9 +441,9 @@ class TestWriteAndWait:
                 client._on_data(encode_fields([TTLVField(2, TYPE_NUMBER, 5)]))
 
         client._sock.sendall.side_effect = receive_after_write
-        assert client.write_and_confirm(
-            [TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=0.01
-        ) is (reply == "match")
+        assert client.write_and_confirm([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=0.01) is (
+            reply == "match"
+        )
 
     def test_cached_matching_value_does_not_confirm_write(self, client):
         client._sock = MagicMock()
