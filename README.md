@@ -38,7 +38,12 @@ def on_message(topic_suffix: str, payload: dict) -> None:
 device_id = f"qd{pk}{dk}"
 client.subscribe_device(device_id, on_message)
 client.send_read(device_id, pk, dk, [p["code"] for p in properties])
+
+# Re-read state after every automatic reconnect.
+client.on_connect = lambda: client.send_read(device_id, pk, dk, [p["code"] for p in properties])
 ```
+
+An unexpected disconnect is retried automatically (calling `token_refresher`, if one was passed, before each attempt) until `disconnect()` or `halt_reconnects()`. Writes sent while the connection is briefly down are queued and replayed on reconnect; reads are dropped, so `on_connect` is the place to re-read state.
 
 Async equivalents (`async_login`, `async_get_device_list`, `async_get_tsl`, `async_refresh_token`, `async_get_device_attributes`) are also exported — each wraps the sync call in a thread executor.
 

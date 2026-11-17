@@ -1,418 +1,479 @@
 import json
-from unittest.mock import MagicMock, patch
+import threading
+from unittest.mock import MagicMock
 
 import pytest
+from paho.mqtt.packettypes import PacketTypes
+from paho.mqtt.reasoncodes import ReasonCode
 
 from landbook_api import DEFAULT_REGION, REGIONS, LandbookMQTTClient
-from landbook_api.mqtt_client import WRITE_RETRY_WINDOW
+from landbook_api import mqtt_client as mqtt_module
+
+ACCEPTED = ReasonCode(PacketTypes.CONNACK, "Success")
+NOT_AUTHORIZED = ReasonCode(PacketTypes.CONNACK, "Not authorized")
+DROPPED = ReasonCode(PacketTypes.DISCONNECT, "Unspecified error")
+SUFFIXES = ("ack_", "bus_", "onl_", "ota_", "inf_", "loc_")
+
+
+class FakeTimer:
+    def __init__(self, interval, function):
+        self.interval = interval
+        self.function = function
+        self.cancelled = False
+        self.daemon = False
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        self.function()
+
+
+class Broker:
+    """Stands in for paho: every mqtt.Client() the library creates is a mock
+    whose connect() answers with `connack` (None = never answers)."""
+
+    def __init__(self, monkeypatch):
+        self.clients: list[MagicMock] = []
+        self.timers: list[FakeTimer] = []
+        self.connack: ReasonCode | None = ACCEPTED
+        self.connect_error: Exception | None = None
+        self.on_disconnect_during_teardown = False
+        monkeypatch.setattr(mqtt_module.mqtt, "Client", self._new_client)
+        monkeypatch.setattr(mqtt_module.threading, "Timer", self._new_timer)
+
+    def _new_client(self, *args, **kwargs):
+        client = MagicMock()
+        client.constructed_with = kwargs
+
+        def connect(*_a, **_kw):
+            if self.connect_error:
+                raise self.connect_error
+            if self.connack is not None:
+                client.on_connect(client, None, None, self.connack, None)
+
+        def disconnect():
+            if self.on_disconnect_during_teardown:
+                client.on_disconnect(client, None, None, DROPPED, None)
+
+        client.connect.side_effect = connect
+        client.disconnect.side_effect = disconnect
+        self.clients.append(client)
+        return client
+
+    def _new_timer(self, interval, function):
+        timer = FakeTimer(interval, function)
+        self.timers.append(timer)
+        return timer
+
+    @property
+    def current(self) -> MagicMock:
+        return self.clients[-1]
+
+    def drop(self, client=None):
+        client = client or self.current
+        client.on_disconnect(client, None, None, DROPPED, None)
+
+    def deliver(self, topic, payload, client=None):
+        client = client or self.current
+        msg = MagicMock()
+        msg.topic = topic
+        msg.payload = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        client.on_message(client, None, msg)
+
+    def published(self, client=None):
+        client = client or self.current
+        return [(c.args[0], json.loads(c.args[1])) for c in client.publish.call_args_list]
+
+    def subscribed(self, client=None):
+        client = client or self.current
+        return [c.args[0] for c in client.subscribe.call_args_list]
+
+    def pending_timers(self):
+        return [t for t in self.timers if not t.cancelled]
 
 
 @pytest.fixture
-def client():
+def broker(monkeypatch):
+    return Broker(monkeypatch)
+
+
+@pytest.fixture
+def client(broker):
     return LandbookMQTTClient(uid="u1", bearer_token="Bearer tok")
 
 
-class TestConstruction:
-    def test_defaults_to_us_mqtt_host(self, client):
-        assert client._mqtt_host == REGIONS[DEFAULT_REGION]["mqtt_host"]
+class TestConnect:
+    def test_configures_websocket_tls_session(self, broker, client):
+        client.connect()
+        paho = broker.current
+        paho.ws_set_options.assert_called_once_with(path="/ws/v2")
+        paho.tls_set.assert_called_once()
+        paho.username_pw_set.assert_called_once_with("", "Bearer tok")
+        paho.connect.assert_called_once_with(
+            REGIONS[DEFAULT_REGION]["mqtt_host"], 8443, keepalive=40
+        )
+        assert client.is_connected
 
-    def test_custom_mqtt_host(self):
-        c = LandbookMQTTClient(uid="u1", bearer_token="t", mqtt_host="custom.host")
-        assert c._mqtt_host == "custom.host"
+    def test_custom_mqtt_host(self, broker):
+        LandbookMQTTClient(uid="u1", bearer_token="t", mqtt_host="custom.host").connect()
+        assert broker.current.connect.call_args.args[0] == "custom.host"
 
-    def test_initial_state(self, client):
+    def test_refused_connack_raises_and_cleans_up(self, broker, client):
+        broker.connack = NOT_AUTHORIZED
+        with pytest.raises(ConnectionError, match="refused"):
+            client.connect()
+        broker.current.loop_stop.assert_called_once()
+        broker.current.disconnect.assert_called_once()
+        assert not client.is_connected
+
+    def test_no_connack_times_out_and_cleans_up(self, broker, client, monkeypatch):
+        monkeypatch.setattr(mqtt_module, "CONNECT_TIMEOUT", 0.01)
+        broker.connack = None
+        with pytest.raises(ConnectionError, match="timed out"):
+            client.connect()
+        broker.current.loop_stop.assert_called_once()
+        assert not client.is_connected
+
+    def test_socket_error_propagates_and_cleans_up(self, broker, client):
+        broker.connect_error = OSError("unreachable")
+        with pytest.raises(OSError, match="unreachable"):
+            client.connect()
+        broker.current.loop_stop.assert_called_once()
+        assert not client.is_connected
+
+    def test_connect_again_replaces_the_old_session(self, broker, client):
+        client.connect()
+        first = broker.current
+        client.connect()
+        first.loop_stop.assert_called_once()
+        first.disconnect.assert_called_once()
+        assert len(broker.clients) == 2
+        assert client.is_connected
+
+    def test_on_connect_callback_fires(self, broker, client):
+        client.on_connect = MagicMock()
+        client.connect()
+        client.on_connect.assert_called_once_with()
+
+    def test_paho_does_not_retry_on_its_own(self, broker, client):
+        # Only the library's reconnect (fresh client, refreshed token) may retry.
+        client.connect()
+        assert broker.current.constructed_with["reconnect_on_failure"] is False
+
+    def test_teardown_does_not_hold_the_lock_paho_callbacks_need(self, broker, client):
+        client.connect()
+        old = broker.current
+
+        def loop_stop():
+            # paho joins its network thread here; that thread may be mid-callback.
+            t = threading.Thread(target=old.on_connect, args=(old, None, None, ACCEPTED, None))
+            t.start()
+            t.join(2.0)
+            assert not t.is_alive()
+
+        old.loop_stop.side_effect = loop_stop
+        client.reconnect()
+        assert client.is_connected
+
+
+class TestLandbookHaCompatibility:
+    """landbook-ha <= 2.2.6 touches these private names directly."""
+
+    def test_on_reconnect_assignment(self, broker, client):
+        cb = MagicMock()
+        client._on_reconnect = cb
+        client.connect()
+        cb.assert_called_once_with()
+
+    def test_connected_reads_as_bool(self, broker, client):
+        client.connect()
+        assert client._connected is True
+        broker.drop()
         assert client._connected is False
-        assert client._shutting_down is False
-        assert client._client is None
-        assert client._listeners == {}
 
-
-class TestUpdateToken:
-    def test_stores_new_token(self, client):
-        client.update_token("Bearer new")
-        assert client._bearer_token == "Bearer new"
-
-
-class TestHaltReconnects:
-    def test_sets_reauth_pending(self, client):
+    def test_clearing_reauth_pending_resumes_auto_reconnect(self, broker, client):
+        client.connect()
         client.halt_reconnects()
         assert client._reauth_pending is True
-
-    def test_cancels_existing_timer(self, client):
-        timer = MagicMock()
-        client._reconnect_timer = timer
-        client.halt_reconnects()
-        timer.cancel.assert_called_once()
-        assert client._reconnect_timer is None
+        client._reauth_pending = False
+        broker.drop()
+        assert len(broker.pending_timers()) == 1
 
 
-class TestDisconnect:
-    def test_disconnect_without_connect(self, client):
-        client.disconnect()
-        assert client._shutting_down is True
-        assert client._connected is False
+class TestSubscriptions:
+    def test_subscribing_before_connect_subscribes_on_connect(self, broker, client):
+        client.subscribe_device("dev1", MagicMock())
+        client.connect()
+        assert sorted(broker.subscribed()) == sorted(f"q/2/d/dev1/{s}" for s in SUFFIXES)
 
-    def test_disconnect_stops_loop_and_disconnects(self, client):
-        mock_mqtt = MagicMock()
-        client._client = mock_mqtt
-        client._connected = True
-        client.disconnect()
-        mock_mqtt.loop_stop.assert_called_once()
-        mock_mqtt.disconnect.assert_called_once()
-        assert client._client is None
-        assert client._connected is False
+    def test_subscribing_while_connected_subscribes_once_per_device(self, broker, client):
+        client.connect()
+        client.subscribe_device("dev1", MagicMock())
+        client.subscribe_device("dev1", MagicMock())
+        assert len(broker.subscribed()) == len(SUFFIXES)
 
-    def test_disconnect_cancels_reconnect_timer(self, client):
-        timer = MagicMock()
-        client._reconnect_timer = timer
-        client.disconnect()
-        timer.cancel.assert_called_once()
+    def test_new_session_resubscribes(self, broker, client):
+        client.subscribe_device("dev1", MagicMock())
+        client.connect()
+        client.reconnect()
+        assert len(broker.subscribed()) == len(SUFFIXES)
 
-
-class TestSubscribeDevice:
-    def test_registers_callback(self, client):
-        cb = MagicMock()
-        client.subscribe_device("dev1", cb)
-        assert cb in client._listeners["dev1"]
-
-    def test_multiple_callbacks_same_device(self, client):
-        cb1, cb2 = MagicMock(), MagicMock()
+    def test_dispatches_message_to_device_callbacks(self, broker, client):
+        cb1, cb2, other = MagicMock(), MagicMock(), MagicMock()
         client.subscribe_device("dev1", cb1)
         client.subscribe_device("dev1", cb2)
-        assert len(client._listeners["dev1"]) == 2
+        client.subscribe_device("dev2", other)
+        client.connect()
+        broker.deliver("q/2/d/dev1/bus_", {"kv": {"switch": True}})
+        cb1.assert_called_once_with("bus_", {"kv": {"switch": True}})
+        cb2.assert_called_once_with("bus_", {"kv": {"switch": True}})
+        other.assert_not_called()
 
-    def test_subscribes_topics_when_connected(self, client):
-        mock_mqtt = MagicMock()
-        client._client = mock_mqtt
-        client._connected = True
-        client.subscribe_device("dev1", MagicMock())
-        assert mock_mqtt.subscribe.call_count == 6
-        topics = [c[0][0] for c in mock_mqtt.subscribe.call_args_list]
-        for suffix in ("ack_", "bus_", "onl_", "ota_", "inf_", "loc_"):
-            assert f"q/2/d/dev1/{suffix}" in topics
-
-    def test_does_not_subscribe_when_not_connected(self, client):
-        mock_mqtt = MagicMock()
-        client._client = mock_mqtt
-        client._connected = False
-        client.subscribe_device("dev1", MagicMock())
-        mock_mqtt.subscribe.assert_not_called()
-
-
-class TestUnsubscribeDevice:
-    def test_removes_callback(self, client):
+    @pytest.mark.parametrize(
+        ("topic", "payload"), [("q/2/d", b"{}"), ("q/2/d/dev1/bus_", b"not json")]
+    )
+    def test_ignores_unparseable_messages(self, broker, client, topic, payload):
         cb = MagicMock()
         client.subscribe_device("dev1", cb)
-        client.unsubscribe_device("dev1", cb)
-        assert cb not in client._listeners["dev1"]
+        client.connect()
+        broker.deliver(topic, payload)
+        cb.assert_not_called()
 
-    def test_leaves_other_callbacks(self, client):
+    def test_listener_exception_does_not_break_others(self, broker, client):
+        cb2 = MagicMock()
+        client.subscribe_device("dev1", MagicMock(side_effect=ValueError("boom")))
+        client.subscribe_device("dev1", cb2)
+        client.connect()
+        broker.deliver("q/2/d/dev1/ack_", {"ok": True})
+        cb2.assert_called_once()
+
+    def test_callback_unsubscribing_itself_does_not_skip_the_next(self, broker, client):
+        after = MagicMock()
+
+        def once(_suffix, _payload):
+            client.unsubscribe_device("dev1", once)
+
+        client.subscribe_device("dev1", once)
+        client.subscribe_device("dev1", after)
+        client.connect()
+        broker.deliver("q/2/d/dev1/bus_", {})
+        after.assert_called_once()
+
+    def test_unsubscribe_removes_only_that_callback(self, broker, client):
         cb1, cb2 = MagicMock(), MagicMock()
         client.subscribe_device("dev1", cb1)
         client.subscribe_device("dev1", cb2)
         client.unsubscribe_device("dev1", cb1)
-        assert cb1 not in client._listeners["dev1"]
-        assert cb2 in client._listeners["dev1"]
-
-    def test_unknown_device_is_noop(self, client):
+        client.unsubscribe_device("dev1", MagicMock())
         client.unsubscribe_device("nonexistent", MagicMock())
-
-    def test_unknown_callback_is_noop(self, client):
-        cb1, cb2 = MagicMock(), MagicMock()
-        client.subscribe_device("dev1", cb1)
-        client.unsubscribe_device("dev1", cb2)
-        assert cb1 in client._listeners["dev1"]
+        client.connect()
+        broker.deliver("q/2/d/dev1/bus_", {})
+        cb1.assert_not_called()
+        cb2.assert_called_once()
 
 
-class TestSendRead:
-    def test_publishes_read_attr(self, client):
-        mock_mqtt = MagicMock()
-        client._client = mock_mqtt
-        client._connected = True
+class TestPublish:
+    def test_send_read(self, broker, client):
+        client.connect()
         client.send_read("dev1", "pk1", "dk1", ["switch", "brightness"])
-        mock_mqtt.publish.assert_called_once()
-        topic, payload_str = mock_mqtt.publish.call_args[0]
+        [(topic, payload)] = broker.published()
         assert topic == "q/1/d/dev1/sys_"
-        payload = json.loads(payload_str)
         assert payload["type"] == "READ-ATTR"
         assert payload["productKey"] == "pk1"
         assert payload["deviceKey"] == "dk1"
         assert json.loads(payload["kv"]) == ["switch", "brightness"]
 
-    def test_noop_when_not_connected(self, client):
-        client.send_read("dev1", "pk1", "dk1", ["switch"])
-
-    def test_increments_msg_counter(self, client):
-        mock_mqtt = MagicMock()
-        client._client = mock_mqtt
-        client._connected = True
-        client.send_read("dev1", "pk1", "dk1", ["a"])
-        client.send_read("dev1", "pk1", "dk1", ["b"])
-        p1 = json.loads(mock_mqtt.publish.call_args_list[0][0][1])
-        p2 = json.loads(mock_mqtt.publish.call_args_list[1][0][1])
-        assert p2["msgId"] == p1["msgId"] + 1
-
-
-class TestSendWrite:
-    def test_publishes_write_attr(self, client):
-        mock_mqtt = MagicMock()
-        client._client = mock_mqtt
-        client._connected = True
+    def test_send_write(self, broker, client):
+        client.connect()
         client.send_write("dev1", "pk1", "dk1", {"switch": True})
-        topic, payload_str = mock_mqtt.publish.call_args[0]
+        [(topic, payload)] = broker.published()
         assert topic == "q/1/d/dev1/sys_"
-        payload = json.loads(payload_str)
         assert payload["type"] == "WRITE-ATTR"
         assert json.loads(payload["kv"]) == [{"switch": True}]
 
-    def test_defers_instead_of_raising_when_not_connected(self, client):
-        client.send_write("dev1", "pk1", "dk1", {"switch": True})
-        assert len(client._deferred_writes) == 1
-        assert client._deferred_writes[0][1:] == ("dev1", "pk1", "dk1", {"switch": True})
+    def test_msg_ids_increment_and_wrap_at_16_bits(self, broker, monkeypatch):
+        monkeypatch.setattr(mqtt_module.time, "time", lambda: 65.5345)  # seeds 0xFFFE
+        client = LandbookMQTTClient(uid="u1", bearer_token="t")
+        client.connect()
+        for _ in range(3):
+            client.send_read("d", "p", "k", ["x"])
+        assert [p["msgId"] for _, p in broker.published()] == [0xFFFF, 0, 1]
 
-
-class TestOnMessage:
-    def test_dispatches_to_listeners(self, client):
-        cb = MagicMock()
-        client._listeners["dev1"] = [cb]
-        msg = MagicMock()
-        msg.topic = "q/2/d/dev1/bus_"
-        msg.payload = json.dumps({"kv": {"switch": True}}).encode()
-        client._on_message(None, None, msg)
-        cb.assert_called_once_with("bus_", {"kv": {"switch": True}})
-
-    def test_ignores_unknown_device(self, client):
-        msg = MagicMock()
-        msg.topic = "q/2/d/unknown/bus_"
-        msg.payload = json.dumps({}).encode()
-        client._on_message(None, None, msg)
-
-    def test_ignores_short_topic(self, client):
-        msg = MagicMock()
-        msg.topic = "q/2/d"
-        msg.payload = b"{}"
-        client._on_message(None, None, msg)
-
-    def test_ignores_non_json_payload(self, client):
-        cb = MagicMock()
-        client._listeners["dev1"] = [cb]
-        msg = MagicMock()
-        msg.topic = "q/2/d/dev1/bus_"
-        msg.payload = b"not json"
-        client._on_message(None, None, msg)
-        cb.assert_not_called()
-
-    def test_listener_exception_does_not_break_others(self, client):
-        cb1 = MagicMock(side_effect=ValueError("boom"))
-        cb2 = MagicMock()
-        client._listeners["dev1"] = [cb1, cb2]
-        msg = MagicMock()
-        msg.topic = "q/2/d/dev1/ack_"
-        msg.payload = json.dumps({"ok": True}).encode()
-        client._on_message(None, None, msg)
-        cb2.assert_called_once()
-
-
-class TestOnConnect:
-    def test_successful_connect_sets_connected(self, client):
-        client._listeners["dev1"] = [MagicMock()]
-        mock_mqtt = MagicMock()
-        client._client = mock_mqtt
-        client._on_connect(None, None, None, 0, None)
-        assert client._connected is True
-        assert mock_mqtt.subscribe.call_count == 6
-
-    def test_on_reconnect_callback_fired(self, client):
-        cb = MagicMock()
-        client._on_reconnect = cb
-        client._client = MagicMock()
-        client._on_connect(None, None, None, "Success", None)
-        cb.assert_called_once()
-
-    def test_failed_connect_stays_disconnected(self, client):
-        client._on_connect(None, None, None, 5, None)
-        assert client._connected is False
-
-
-class TestOnDisconnect:
-    def test_clean_shutdown_no_reconnect(self, client):
-        client._shutting_down = True
-        client._on_disconnect(None, None, None, 0, None)
-        assert client._connected is False
-        assert client._reconnect_timer is None
-
-    def test_reauth_pending_no_reconnect(self, client):
-        client._connected = True
-        client._reauth_pending = True
-        client._on_disconnect(None, None, None, 0, None)
-        assert client._connected is False
-        assert client._reconnect_timer is None
-
-    @patch.object(LandbookMQTTClient, "_schedule_reconnect")
-    def test_unexpected_disconnect_schedules_reconnect(self, mock_sched, client):
-        client._connected = True
-        client._on_disconnect(None, None, None, 1, None)
-        assert client._connected is False
-        mock_sched.assert_called_once_with(delay=5)
-
-
-class TestMsgCounterWraps:
-    def test_wraps_at_0xFFFF(self, client):
-        mock_mqtt = MagicMock()
-        client._client = mock_mqtt
-        client._connected = True
-        client._msg_counter = 0xFFFE
-        client.send_read("d", "p", "k", ["x"])
-        client.send_read("d", "p", "k", ["x"])
-        p1 = json.loads(mock_mqtt.publish.call_args_list[0][0][1])
-        p2 = json.loads(mock_mqtt.publish.call_args_list[1][0][1])
-        assert p1["msgId"] == 0xFFFF
-        assert p2["msgId"] == 0
-
-
-class TestConnectTimeout:
-    @patch("landbook_api.mqtt_client.time.sleep")
-    @patch("landbook_api.mqtt_client.mqtt.Client")
-    def test_timeout_stops_loop_and_clears_client(self, mock_cls, mock_sleep):
-        mock_client = MagicMock()
-        mock_cls.return_value = mock_client
-        c = LandbookMQTTClient(uid="u1", bearer_token="Bearer tok")
-        with pytest.raises(ConnectionError, match="MQTT connection timed out"):
-            c.connect()
-        mock_client.loop_stop.assert_called_once()
-        mock_client.disconnect.assert_called_once()
-        assert c._client is None
-
-    @patch("landbook_api.mqtt_client.time.sleep")
-    @patch("landbook_api.mqtt_client.mqtt.Client")
-    def test_successful_connect_keeps_client(self, mock_cls, mock_sleep):
-        mock_client = MagicMock()
-        mock_cls.return_value = mock_client
-        c = LandbookMQTTClient(uid="u1", bearer_token="Bearer tok")
-
-        def _simulate_connect(*_a, **_kw):
-            c._connected = True
-
-        mock_client.connect.side_effect = _simulate_connect
-        c.connect()
-        mock_client.loop_stop.assert_not_called()
-        mock_client.disconnect.assert_not_called()
-        assert c._client is mock_client
+    def test_read_while_disconnected_is_dropped_not_replayed(self, broker, client):
+        client.send_read("dev1", "pk1", "dk1", ["switch"])
+        client.connect()
+        assert broker.published() == []
 
 
 class TestDeferredWrites:
-    """send_write must queue across a disconnect instead of raising, and
-    replay the queue in order once the connection comes back."""
-
-    def test_flush_resends_deferred_writes_in_order(self, client):
+    def test_writes_while_disconnected_replay_in_order_before_on_connect(self, broker, client):
         client.send_write("dev1", "pk", "dk1", {"switch": True})
         client.send_write("dev1", "pk", "dk1", {"speed": 5})
+        published_at_on_connect = []
+        client.on_connect = lambda: published_at_on_connect.extend(broker.published())
 
-        mock_mqtt = MagicMock()
-        client._client = mock_mqtt
-        client._connected = True
-        client._flush_deferred_writes()
+        client.connect()
 
-        payloads = [json.loads(c[0][1]) for c in mock_mqtt.publish.call_args_list]
-        assert [json.loads(p["kv"]) for p in payloads] == [
-            [{"switch": True}],
-            [{"speed": 5}],
-        ]
-        assert client._deferred_writes == []
+        kvs = [json.loads(p["kv"]) for _, p in published_at_on_connect]
+        assert kvs == [[{"switch": True}], [{"speed": 5}]]
 
-    def test_flush_noop_while_still_disconnected(self, client):
+    def test_replayed_only_once(self, broker, client):
         client.send_write("dev1", "pk", "dk1", {"switch": True})
-        client._flush_deferred_writes()
-        assert len(client._deferred_writes) == 1
+        client.connect()
+        client.reconnect()
+        assert broker.published() == []
 
-    def test_flush_drops_expired_writes(self, client):
+    def test_write_during_a_drop_replays_after_auto_reconnect(self, broker, client):
+        client.connect()
+        broker.drop()
         client.send_write("dev1", "pk", "dk1", {"switch": True})
-        deadline, device_id, pk, dk, props = client._deferred_writes[0]
-        client._deferred_writes[0] = (
-            deadline - WRITE_RETRY_WINDOW - 1,
-            device_id,
-            pk,
-            dk,
-            props,
+        broker.pending_timers()[0].fire()
+        [(_, payload)] = broker.published()
+        assert json.loads(payload["kv"]) == [{"switch": True}]
+
+    def test_expired_writes_are_dropped(self, broker, client, monkeypatch):
+        monkeypatch.setattr(mqtt_module, "WRITE_RETRY_WINDOW", -1.0)
+        client.send_write("dev1", "pk", "dk1", {"switch": True})
+        client.connect()
+        assert broker.published() == []
+
+
+class TestAutoReconnect:
+    def test_unexpected_drop_reconnects_with_refreshed_token(self, broker):
+        client = LandbookMQTTClient(
+            uid="u1", bearer_token="Bearer old", token_refresher=lambda: "Bearer new"
         )
+        client.on_connect = MagicMock()
+        client.connect()
+        broker.drop()
+        assert not client.is_connected
 
-        mock_mqtt = MagicMock()
-        client._client = mock_mqtt
-        client._connected = True
-        client._flush_deferred_writes()
+        [timer] = broker.pending_timers()
+        assert timer.interval == mqtt_module.RECONNECT_DELAY
+        timer.fire()
 
-        mock_mqtt.publish.assert_not_called()
-        assert client._deferred_writes == []
+        assert len(broker.clients) == 2
+        broker.current.username_pw_set.assert_called_once_with("", "Bearer new")
+        assert client.is_connected
+        assert client.on_connect.call_count == 2
 
-    def test_on_connect_flushes_before_on_reconnect_callback(self, client):
-        client.send_write("dev1", "pk", "dk1", {"switch": True})
-        client._client = MagicMock()
+    def test_failed_token_refresh_reconnects_with_old_token(self, broker):
+        def refresher():
+            raise RuntimeError("refresh down")
 
-        calls = []
-        client._on_reconnect = lambda: calls.append("on_reconnect")
-        orig_flush = client._flush_deferred_writes
-        client._flush_deferred_writes = lambda: (calls.append("flush"), orig_flush())
+        client = LandbookMQTTClient(uid="u1", bearer_token="Bearer old", token_refresher=refresher)
+        client.connect()
+        broker.drop()
+        broker.pending_timers()[0].fire()
+        broker.current.username_pw_set.assert_called_once_with("", "Bearer old")
+        assert client.is_connected
 
-        client._on_connect(None, None, None, 0, None)
+    def test_refresher_that_halts_reconnects_stops_the_attempt(self, broker):
+        client = None
 
-        assert calls[0] == "flush"
-        assert client._deferred_writes == []
+        def refresher():
+            client.halt_reconnects()
+            return "Bearer new"
+
+        client = LandbookMQTTClient(uid="u1", bearer_token="t", token_refresher=refresher)
+        client.connect()
+        broker.drop()
+        broker.pending_timers()[0].fire()
+        assert len(broker.clients) == 1
+
+    def test_failed_reconnect_retries_later(self, broker, client):
+        client.connect()
+        broker.drop()
+        broker.connack = NOT_AUTHORIZED
+        broker.pending_timers()[0].fire()
+        [retry] = broker.pending_timers()
+        assert retry.interval == mqtt_module.RECONNECT_RETRY_DELAY
+
+        broker.connack = ACCEPTED
+        retry.fire()
+        assert client.is_connected
+
+    def test_halt_reconnects_cancels_pending_and_future_attempts(self, broker, client):
+        client.connect()
+        broker.drop()
+        client.halt_reconnects()
+        assert broker.pending_timers() == []
+        client.connect()
+        client.halt_reconnects()
+        broker.drop()
+        assert broker.pending_timers() == []
+
+    def test_explicit_connect_resumes_auto_reconnect_after_halt(self, broker, client):
+        client.connect()
+        client.halt_reconnects()
+        client.connect()
+        broker.drop()
+        assert len(broker.pending_timers()) == 1
+
+    def test_timer_firing_after_an_explicit_reconnect_leaves_it_alone(self, broker, client):
+        client.connect()
+        broker.drop()
+        timer = broker.pending_timers()[0]
+        client.reconnect()  # e.g. a watchdog got there first
+        timer.fire()  # a timer that was already running when reconnect() hit
+        assert len(broker.clients) == 2
+        assert client.is_connected
+
+    def test_disconnect_does_not_reconnect(self, broker, client):
+        broker.on_disconnect_during_teardown = True
+        client.connect()
+        broker.drop()
+        timer = broker.timers[-1]
+        client.disconnect()
+        assert broker.pending_timers() == []
+        timer.fire()  # a timer that was already running when disconnect() hit
+        assert len(broker.clients) == 1
+        assert not client.is_connected
 
 
 class TestReconnect:
-    def test_tears_down_and_reconnects(self, client):
-        old_mqtt = MagicMock()
-        client._client = old_mqtt
-        client._connected = True
-        client._shutting_down = True
-        timer = MagicMock()
-        client._reconnect_timer = timer
+    def test_old_sessions_disconnect_does_not_schedule_duplicate_reconnect(self, broker, client):
+        """Regression for landbook-ha#27: tearing down the old client fires its
+        on_disconnect (synchronously here; paho may also do it later from its
+        network thread). That must not schedule a reconnect on top of the
+        one reconnect() performs — a second live session for the same
+        account gets every command rejected."""
+        broker.on_disconnect_during_teardown = True
+        client.connect()
+        old = broker.current
+        client.reconnect()
+        broker.drop(old)  # a late callback from the old network thread
+        assert broker.pending_timers() == []
+        assert client.is_connected
+        assert len(broker.clients) == 2
 
-        with patch.object(LandbookMQTTClient, "connect") as mock_connect:
+    def test_old_sessions_late_connack_is_ignored(self, broker, client):
+        client.subscribe_device("dev1", MagicMock())
+        client.on_connect = MagicMock()
+        client.connect()
+        old = broker.current
+        client.reconnect()
+        old.on_connect(old, None, None, ACCEPTED, None)
+        assert broker.subscribed() == [f"q/2/d/dev1/{s}" for s in SUFFIXES]
+        assert client.on_connect.call_count == 2
+
+    def test_failure_propagates_and_later_drops_still_auto_reconnect(self, broker, client):
+        client.connect()
+        broker.connack = NOT_AUTHORIZED
+        with pytest.raises(ConnectionError):
             client.reconnect()
+        broker.connack = ACCEPTED
+        client.reconnect()
+        broker.drop()
+        assert len(broker.pending_timers()) == 1
 
-        old_mqtt.loop_stop.assert_called_once()
-        old_mqtt.disconnect.assert_called_once()
-        timer.cancel.assert_called_once()
-        assert client._client is None
-        assert client._connected is False
-        assert client._shutting_down is False
-        mock_connect.assert_called_once()
 
-    def test_old_clients_on_disconnect_does_not_schedule_duplicate_reconnect(self, client):
-        """Regression for landbook-ha#27: reconnect() tearing down the old
-        client can fire that client's on_disconnect (paho may invoke it
-        synchronously from disconnect(), or shortly after from the network
-        thread). That must not ALSO schedule a reconnect on top of the one
-        reconnect() performs itself — doing so opens a second live MQTT
-        session with colliding msgIds, which the server rejects wholesale."""
-        old_mqtt = MagicMock()
-        client._client = old_mqtt
-        client._connected = True
-
-        def fake_disconnect():
-            client._on_disconnect(None, None, None, 1, None)
-
-        old_mqtt.disconnect.side_effect = fake_disconnect
-
-        with (
-            patch.object(LandbookMQTTClient, "connect") as mock_connect,
-            patch.object(LandbookMQTTClient, "_schedule_reconnect") as mock_sched,
-        ):
-            client.reconnect()
-
-        mock_sched.assert_not_called()
-        mock_connect.assert_called_once()
-        assert client._shutting_down is False
-
-    def test_shutting_down_reset_even_if_connect_fails(self, client):
-        client._client = MagicMock()
-        client._connected = True
-
-        with (
-            patch.object(LandbookMQTTClient, "connect", side_effect=ConnectionError("boom")),
-            pytest.raises(ConnectionError),
-        ):
-            client.reconnect()
-
-        assert client._shutting_down is False
+class TestUpdateToken:
+    def test_next_connection_uses_new_token(self, broker, client):
+        client.update_token("Bearer new")
+        client.connect()
+        broker.current.username_pw_set.assert_called_once_with("", "Bearer new")

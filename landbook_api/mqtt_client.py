@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import paho.mqtt.client as mqtt
 
@@ -21,9 +21,29 @@ _LOGGER = logging.getLogger(__name__)
 # isn't silently applied minutes later.
 WRITE_RETRY_WINDOW = 5.0  # seconds
 
+CONNECT_TIMEOUT = 10.0  # seconds to wait for the broker's CONNACK
+RECONNECT_DELAY = 5.0  # after an unexpected disconnect
+RECONNECT_RETRY_DELAY = 30.0  # after a reconnect attempt itself fails
+
+# Every device topic the broker publishes to: q/2/d/{device_id}/{suffix}
+_DEVICE_TOPIC_SUFFIXES = ("ack_", "bus_", "onl_", "ota_", "inf_", "loc_")
+
+
+class _DeferredWrite(NamedTuple):
+    deadline: float
+    device_id: str
+    pk: str
+    dk: str
+    props: dict
+
 
 class LandbookMQTTClient:
-    """Manages a single persistent MQTT connection for one account."""
+    """Manages a single persistent MQTT connection for one account.
+
+    After connect(), an unexpected drop is retried automatically (refreshing
+    the token first via `token_refresher`, if given) until disconnect() or
+    halt_reconnects() is called.
+    """
 
     def __init__(
         self,
@@ -36,53 +56,114 @@ class LandbookMQTTClient:
         self._bearer_token = bearer_token
         self._mqtt_host = mqtt_host or REGIONS[DEFAULT_REGION]["mqtt_host"]
         self._token_refresher = token_refresher
+
+        # The live paho client. Callbacks from any other client instance are
+        # from one this object already tore down, and are ignored.
         self._client: mqtt.Client | None = None
         self._connected = False
-        self._shutting_down = False
-        self._reauth_pending = False
-        # Seeded from wall-clock time (mod 2**16) rather than a fixed low
-        # value: a fresh client instance is created on every integration
-        # reload/restart, and a fixed seed meant every such session replayed
-        # the same ~1001-1018 msgId range. If the server dedups/rejects
-        # recently-seen msgIds (independent of the underlying connection),
-        # that guarantees collisions across sessions. Time-seeding makes
-        # collisions between two sessions' id ranges unlikely without
-        # requiring any persisted state.
-        self._msg_counter = int(time.time() * 1000) & 0xFFFF
+        self._connack = threading.Event()
+        self._auto_reconnect = False
         self._reconnect_timer: threading.Timer | None = None
-        # (deadline, device_id, pk, dk, props) for writes that hit a
-        # disconnected client; replayed in order by _flush_deferred_writes
-        # once the connection comes back.
-        self._deferred_writes: list[tuple[float, str, str, str, dict]] = []
 
-        # Serialize all wire operations. The same client instance is shared
-        # across every device of one account (multiple concurrent publishers)
-        # and is invoked both from the caller's thread and from paho's network
-        # loop thread (_on_connect -> _on_reconnect). Concurrent publish()
-        # calls race on paho's internal _sendbuffer and raise BufferError
-        # ("Existing exports of data: object cannot be re-sized"), so every
-        # socket op takes a per-instance lock. RLock because _subscribe_topics
-        # is called both externally (via subscribe_device, already locked) and
-        # internally from _on_connect on the network thread.
+        # Seeded from wall-clock time rather than a fixed value: if the server
+        # dedups/rejects recently-seen msgIds independent of the connection,
+        # a fixed seed would make every new client instance (e.g. after a
+        # process restart) collide with the previous one's id range.
+        self._msg_counter = int(time.time() * 1000) & 0xFFFF
+        self._deferred_writes: list[_DeferredWrite] = []
+
+        # One client instance is shared by every device on the account and is
+        # called from the caller's threads and paho's network thread.
+        # Concurrent publish() calls race on paho's internal _sendbuffer and
+        # raise BufferError ("Existing exports of data: object cannot be
+        # re-sized"), so every socket op takes this lock.
         self._wire_lock = threading.RLock()
+        # Serializes connect/disconnect/timer reconnects, so only one
+        # connection attempt (and one CONNACK wait) is ever in flight.
+        self._lifecycle_lock = threading.Lock()
 
-        # device_id -> list of callbacks
         self._listeners: dict[str, list[Callable[[str, Any], None]]] = {}
-        # called after (re)connect to refresh state
-        self._on_reconnect: Callable[[], None] | None = None
+
+        # Called with no arguments after every successful (re)connect, once
+        # topics are resubscribed and deferred writes replayed — the place to
+        # re-read device state that may have changed while disconnected.
+        self.on_connect: Callable[[], None] | None = None
+
+    # landbook-ha <= 2.2.6 assigns these private names directly; remove once
+    # it uses on_connect and connect()/halt_reconnects() instead.
+    @property
+    def _on_reconnect(self) -> Callable[[], None] | None:
+        return self.on_connect
+
+    @_on_reconnect.setter
+    def _on_reconnect(self, callback: Callable[[], None] | None) -> None:
+        self.on_connect = callback
+
+    @property
+    def _reauth_pending(self) -> bool:
+        return not self._auto_reconnect
+
+    @_reauth_pending.setter
+    def _reauth_pending(self, pending: bool) -> None:
+        if pending:
+            self.halt_reconnects()
+        else:
+            self._auto_reconnect = True
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
 
     # ------------------------------------------------------------------
-    # Public API
+    # Connection lifecycle
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
-        """Establish the WebSocket/TLS MQTT connection (blocking until connected or timeout)."""
-        client_id = f"qu_{self._uid}_{int(time.time() * 1000)}"
+        """Establish the connection, blocking until the broker accepts it.
+
+        Any existing connection is torn down first. Raises ConnectionError if
+        the broker refuses it or doesn't answer within CONNECT_TIMEOUT, or the
+        underlying OSError if the broker can't be reached.
+        """
+        with self._lifecycle_lock:
+            self._auto_reconnect = True
+            self._open()
+
+    def reconnect(self) -> None:
+        """Tear down and re-establish the connection from scratch.
+
+        For a caller (e.g. a watchdog) that has independently determined the
+        connection is silently dead — the broker can drop a WebSocket link
+        mid-stream without paho ever calling on_disconnect, so keepalive
+        alone doesn't catch it. Same as connect().
+        """
+        self.connect()
+
+    def disconnect(self) -> None:
+        with self._lifecycle_lock:
+            self._auto_reconnect = False
+            self._teardown()
+
+    def halt_reconnects(self) -> None:
+        """Stop all automatic reconnect attempts (e.g. while reauth is pending)
+        until the next explicit connect() or reconnect()."""
+        self._auto_reconnect = False
+        self._cancel_reconnect_timer()
+
+    def update_token(self, bearer_token: str) -> None:
+        """Set the token used by the next connection attempt."""
+        self._bearer_token = bearer_token
+
+    def _open(self) -> None:
+        self._teardown()
         client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
-            client_id=client_id,
+            client_id=f"qu_{self._uid}_{int(time.time() * 1000)}",
             transport="websockets",
             protocol=mqtt.MQTTv311,
+            # Reconnects go through _reconnect_from_timer (fresh client, fresh
+            # token) only; paho's own retry would reuse the old token.
+            reconnect_on_failure=False,
         )
         client.ws_set_options(path=MQTT_WS_PATH)
         client.tls_set()
@@ -91,81 +172,78 @@ class LandbookMQTTClient:
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect
 
-        client.connect(self._mqtt_host, MQTT_PORT, keepalive=MQTT_KEEPALIVE)
-        client.loop_start()
-        self._client = client
-
-        for _ in range(40):
-            if self._connected:
-                break
-            time.sleep(0.25)
-
-        if not self._connected:
-            client.loop_stop()
-            client.disconnect()
-            self._client = None
-            raise ConnectionError("MQTT connection timed out")
-
-    def update_token(self, bearer_token: str) -> None:
-        """Update the stored token (e.g. after a refresh)."""
-        self._bearer_token = bearer_token
-
-    def halt_reconnects(self) -> None:
-        """Stop all reconnect attempts (e.g. while reauth is pending)."""
-        self._reauth_pending = True
-        if self._reconnect_timer:
-            self._reconnect_timer.cancel()
-            self._reconnect_timer = None
-
-    def disconnect(self) -> None:
         with self._wire_lock:
-            self._shutting_down = True
-            if self._reconnect_timer:
-                self._reconnect_timer.cancel()
-                self._reconnect_timer = None
-            if self._client:
-                self._client.loop_stop()
-                self._client.disconnect()
-                self._client = None
-            self._connected = False
+            self._client = client
+            self._connack.clear()
+        try:
+            client.connect(self._mqtt_host, MQTT_PORT, keepalive=MQTT_KEEPALIVE)
+            client.loop_start()
+            if not self._connack.wait(CONNECT_TIMEOUT):
+                raise ConnectionError("MQTT connection timed out")
+            if not self._connected:
+                raise ConnectionError("MQTT connection refused")
+        except BaseException:
+            self._teardown()
+            raise
 
-    def reconnect(self) -> None:
-        """Tear down and re-establish the connection from scratch.
+    def _teardown(self) -> None:
+        """Detach and stop the current client.
 
-        For a caller (e.g. a watchdog) that has independently determined the
-        connection is silently dead — the broker can drop a WebSocket link
-        mid-stream without paho ever calling on_disconnect, so keepalive
-        alone doesn't catch it.
+        Detaching first makes the old client's own on_disconnect (which paho
+        may fire synchronously from disconnect() or later from its network
+        thread) a stale callback, so it can't schedule a second reconnect on
+        top of whatever the caller does next — two live sessions for one
+        account get every command rejected (landbook-ha#27). Stopping happens
+        outside the lock because loop_stop() joins the network thread, which
+        may be waiting on that lock in _on_connect.
         """
         with self._wire_lock:
-            # Suppress the old client's _on_disconnect from *also* scheduling
-            # a reconnect: disconnect() below fires it (sometimes off-thread,
-            # sometimes synchronously depending on paho's internal state),
-            # and this method already re-establishes the connection itself.
-            # Without this, both the scheduled reconnect and this method's
-            # own self.connect() call go through, producing two live MQTT
-            # sessions for the same account — duplicate subscriptions and
-            # colliding msgIds that the server rejects (SENDACK status:
-            # 'fail' on every command). See landbook-ha#27.
-            self._shutting_down = True
-            if self._reconnect_timer:
-                self._reconnect_timer.cancel()
-                self._reconnect_timer = None
-            if self._client:
-                self._client.loop_stop()
-                self._client.disconnect()
-                self._client = None
+            client, self._client = self._client, None
             self._connected = False
-        try:
-            self.connect()
-        finally:
-            self._shutting_down = False
+        self._cancel_reconnect_timer()
+        if client is not None:
+            client.loop_stop()
+            client.disconnect()
 
-    def subscribe_device(
-        self,
-        device_id: str,
-        callback: Callable[[str, Any], None],
-    ) -> None:
+    def _schedule_reconnect(self, delay: float) -> None:
+        self._cancel_reconnect_timer()
+        timer = threading.Timer(delay, self._reconnect_from_timer)
+        timer.daemon = True
+        self._reconnect_timer = timer
+        timer.start()
+
+    def _cancel_reconnect_timer(self) -> None:
+        timer, self._reconnect_timer = self._reconnect_timer, None
+        if timer is not None:
+            timer.cancel()
+
+    def _reconnect_from_timer(self) -> None:
+        if not self._auto_reconnect:
+            return
+        _LOGGER.info("Landbook MQTT attempting reconnect")
+        if self._token_refresher:
+            try:
+                self._bearer_token = self._token_refresher()
+            except Exception as exc:  # noqa: BLE001 - best-effort refresh, fall back to old token rather than abort the reconnect
+                _LOGGER.warning("Token refresh failed, reconnecting with old token: %s", exc)
+        with self._lifecycle_lock:
+            # The refresher may itself have halted reconnects (e.g. reauth
+            # needed), or disconnect()/connect() may have run meanwhile.
+            if not self._auto_reconnect or self._connected:
+                return
+            try:
+                self._open()
+            except Exception as exc:  # noqa: BLE001 - retry loop, must survive any connect failure
+                _LOGGER.warning(
+                    "Reconnect failed: %s — will retry in %.0fs", exc, RECONNECT_RETRY_DELAY
+                )
+                self._schedule_reconnect(RECONNECT_RETRY_DELAY)
+
+    # ------------------------------------------------------------------
+    # Pub/sub
+    # ------------------------------------------------------------------
+
+    def subscribe_device(self, device_id: str, callback: Callable[[str, Any], None]) -> None:
         """Subscribe to all topics for a device and register a callback.
 
         callback(topic_suffix, payload_dict)
@@ -173,179 +251,127 @@ class LandbookMQTTClient:
         with self._wire_lock:
             if device_id not in self._listeners:
                 self._listeners[device_id] = []
-                if self._client and self._connected:
+                if self._connected:
                     self._subscribe_topics(device_id)
-
             self._listeners[device_id].append(callback)
 
-    def unsubscribe_device(
-        self,
-        device_id: str,
-        callback: Callable[[str, Any], None],
-    ) -> None:
+    def unsubscribe_device(self, device_id: str, callback: Callable[[str, Any], None]) -> None:
         """Remove a previously registered callback for a device.
 
         If this was the last callback for the device, the MQTT topic
-        subscriptions for that device are left in place (harmless — paho
-        just drops messages with no matching handler) rather than
-        unsubscribing, which avoids a race with an in-flight message on
-        the broker.
+        subscriptions for that device are left in place (harmless — messages
+        with no listener are dropped) rather than unsubscribing, which avoids
+        a race with an in-flight message on the broker.
         """
         with self._wire_lock:
-            cbs = self._listeners.get(device_id)
-            if cbs is not None:
-                try:
-                    cbs.remove(callback)
-                except ValueError:
-                    pass
+            callbacks = self._listeners.get(device_id, [])
+            if callback in callbacks:
+                callbacks.remove(callback)
 
     def send_read(self, device_id: str, pk: str, dk: str, codes: list[str]) -> None:
-        """Request current values for the given property codes (READ-ATTR)."""
+        """Request current values for the given property codes (READ-ATTR).
+
+        Dropped while disconnected: on_connect is the place to re-read state
+        once the connection is back.
+        """
         with self._wire_lock:
-            if not self._client or not self._connected:
+            if not self._connected:
                 return
-            self._msg_counter = (self._msg_counter + 1) & 0xFFFF
-            payload = json.dumps(
-                {
-                    "msgId": self._msg_counter,
-                    "productKey": pk,
-                    "deviceKey": dk,
-                    "type": "READ-ATTR",
-                    "kv": json.dumps(codes),
-                    "cacheTime": 0,
-                    "isCache": False,
-                    "isCover": False,
-                }
-            )
-            self._client.publish(f"q/1/d/{device_id}/sys_", payload, qos=1)
-            _LOGGER.debug("send_read device=%s codes=%s", device_id, codes)
+            self._publish(device_id, pk, dk, "READ-ATTR", codes)
 
     def send_write(self, device_id: str, pk: str, dk: str, props: dict) -> None:
         """Publish a WRITE-ATTR command.
 
         If the connection is momentarily down (e.g. the ~1-3s blip during a
         token-rotation reconnect), the write is queued instead of raising and
-        is replayed in order once the connection comes back — see
-        _flush_deferred_writes. A write still queued after WRITE_RETRY_WINDOW
-        is dropped rather than applied late.
+        is replayed in order once the connection comes back. A write still
+        queued after WRITE_RETRY_WINDOW is dropped rather than applied late.
         """
         with self._wire_lock:
-            if not self._client or not self._connected:
+            if not self._connected:
+                now = time.monotonic()
+                self._deferred_writes = [w for w in self._deferred_writes if w.deadline >= now]
                 self._deferred_writes.append(
-                    (time.monotonic() + WRITE_RETRY_WINDOW, device_id, pk, dk, props)
+                    _DeferredWrite(now + WRITE_RETRY_WINDOW, device_id, pk, dk, props)
                 )
                 _LOGGER.info(
                     "Landbook: write to %s deferred (MQTT down), will resend on reconnect", dk
                 )
                 return
-            self._publish_write(device_id, pk, dk, props)
+            self._publish(device_id, pk, dk, "WRITE-ATTR", [props])
 
-    def _publish_write(self, device_id: str, pk: str, dk: str, props: dict) -> None:
-        assert self._client
+    def _publish(self, device_id: str, pk: str, dk: str, msg_type: str, kv: list) -> None:
+        assert self._client is not None
         self._msg_counter = (self._msg_counter + 1) & 0xFFFF
-        payload = json.dumps(
-            {
-                "msgId": self._msg_counter,
-                "productKey": pk,
-                "deviceKey": dk,
-                "type": "WRITE-ATTR",
-                "kv": json.dumps([props]),
-                "cacheTime": 0,
-                "isCache": False,
-                "isCover": False,
-            }
-        )
-        self._client.publish(f"q/1/d/{device_id}/sys_", payload, qos=1)
-        _LOGGER.debug("send_write device=%s props=%s", device_id, props)
+        payload = {
+            "msgId": self._msg_counter,
+            "productKey": pk,
+            "deviceKey": dk,
+            "type": msg_type,
+            "kv": json.dumps(kv),
+            "cacheTime": 0,
+            "isCache": False,
+            "isCover": False,
+        }
+        self._client.publish(f"q/1/d/{device_id}/sys_", json.dumps(payload), qos=1)
+        _LOGGER.debug("%s device=%s kv=%s", msg_type, device_id, kv)
+
+    def _subscribe_topics(self, device_id: str) -> None:
+        assert self._client is not None
+        for suffix in _DEVICE_TOPIC_SUFFIXES:
+            self._client.subscribe(f"q/2/d/{device_id}/{suffix}", qos=1)
 
     def _flush_deferred_writes(self) -> None:
         now = time.monotonic()
-        with self._wire_lock:
-            idx = 0
-            while idx < len(self._deferred_writes):
-                deadline, device_id, pk, dk, props = self._deferred_writes[idx]
-                if now > deadline:
-                    _LOGGER.info(
-                        "Landbook: dropping deferred write to %s (expired while disconnected)",
-                        dk,
-                    )
-                    idx += 1
-                    continue
-                if not self._client or not self._connected:
-                    break
-                self._publish_write(device_id, pk, dk, props)
-                idx += 1
-            if idx:
-                del self._deferred_writes[:idx]
+        pending, self._deferred_writes = self._deferred_writes, []
+        for write in pending:
+            if now > write.deadline:
+                _LOGGER.info(
+                    "Landbook: dropping deferred write to %s (expired while disconnected)",
+                    write.dk,
+                )
+                continue
+            self._publish(write.device_id, write.pk, write.dk, "WRITE-ATTR", [write.props])
 
     # ------------------------------------------------------------------
-    # Internal
+    # paho callbacks (network thread)
     # ------------------------------------------------------------------
 
-    def _subscribe_topics(self, device_id: str) -> None:
+    def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
         with self._wire_lock:
-            assert self._client
-            # Subscribe to all known downstream topics for this device
-            for suffix in ("ack_", "bus_", "onl_", "ota_", "inf_", "loc_"):
-                self._client.subscribe(f"q/2/d/{device_id}/{suffix}", qos=1)
-
-    def _on_connect(self, client, userdata, flags, reason_code, properties):
-        if str(reason_code) in ("Success", "0") or reason_code == 0:
+            if client is not self._client:
+                return
+            if reason_code.is_failure:
+                _LOGGER.error("Landbook MQTT connect failed: %s", reason_code)
+                self._connack.set()
+                return
             self._connected = True
             for device_id in self._listeners:
                 self._subscribe_topics(device_id)
-            _LOGGER.info("Landbook MQTT connected")
             self._flush_deferred_writes()
-            if self._on_reconnect:
-                self._on_reconnect()
-        else:
-            _LOGGER.error("Landbook MQTT connect failed: %s", reason_code)
+        self._connack.set()
+        _LOGGER.info("Landbook MQTT connected")
+        if self.on_connect:
+            self.on_connect()
 
-    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
-        self._connected = False
-        if self._shutting_down:
-            _LOGGER.debug("Landbook MQTT disconnected cleanly (unload)")
-            return
-        if self._reauth_pending:
-            _LOGGER.debug("Landbook MQTT disconnected while reauth pending — not reconnecting")
-            return
-        _LOGGER.warning("Landbook MQTT disconnected: %s — scheduling reconnect", reason_code)
-        self._schedule_reconnect(delay=5)
-
-    def _schedule_reconnect(self, delay: float = 5) -> None:
-        if self._reconnect_timer:
-            self._reconnect_timer.cancel()
-        self._reconnect_timer = threading.Timer(delay, self._reconnect)
-        self._reconnect_timer.daemon = True
-        self._reconnect_timer.start()
-
-    def _reconnect(self) -> None:
-        if self._reauth_pending:
-            return
-        _LOGGER.info("Landbook MQTT attempting reconnect")
-        try:
-            if self._token_refresher:
-                self._bearer_token = self._token_refresher()
-                _LOGGER.debug("Token refreshed before reconnect")
-        except Exception as exc:  # noqa: BLE001 - best-effort refresh, fall back to old token rather than abort the reconnect
-            _LOGGER.warning("Token refresh failed, reconnecting with old token: %s", exc)
-        if self._reauth_pending:
-            return
-        try:
-            if self._client:
-                self._client.loop_stop()
-            self.connect()
-        except Exception as exc:  # noqa: BLE001 - retry loop, must survive any connect failure
-            _LOGGER.warning("Reconnect failed: %s — will retry in 30s", exc)
-            self._schedule_reconnect(delay=30)
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties) -> None:
+        # Under the lock so _teardown's detach-then-cancel can't interleave
+        # with a reconnect being scheduled here.
+        with self._wire_lock:
+            if client is not self._client:
+                return
+            self._connected = False
+            if not self._auto_reconnect:
+                _LOGGER.debug("Landbook MQTT disconnected with reconnects halted")
+                return
+            _LOGGER.warning("Landbook MQTT disconnected: %s — scheduling reconnect", reason_code)
+            self._schedule_reconnect(RECONNECT_DELAY)
 
     def _on_message(self, client, userdata, msg: mqtt.MQTTMessage) -> None:
         parts = msg.topic.split("/")
-        # topic format: q/2/d/{device_id}/{suffix}
         if len(parts) < 5:
             return
-        device_id = parts[3]
-        suffix = parts[4]
+        device_id, suffix = parts[3], parts[4]
 
         try:
             payload = json.loads(msg.payload.decode())
@@ -355,7 +381,9 @@ class LandbookMQTTClient:
 
         _LOGGER.debug("MQTT [%s] %s: %s", device_id, suffix, payload)
 
-        for cb in self._listeners.get(device_id, []):
+        with self._wire_lock:
+            callbacks = list(self._listeners.get(device_id, []))
+        for cb in callbacks:
             try:
                 cb(suffix, payload)
             except Exception:

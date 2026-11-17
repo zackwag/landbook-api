@@ -60,7 +60,9 @@ client.connect()  # raises ConnectionError on timeout or a rejected login
 properties = get_tsl(bearer_token, pk, region="us")
 switch = next(p for p in properties if p["code"] == "switch")
 
-client.write([field_for_property(switch["id"], switch["dataType"], True)])
+fields = [field_for_property(switch["id"], switch["dataType"], True)]
+if not client.write_and_wait(fields, timeout=2.0):
+    print("no write ack — fall back to cloud MQTT")
 
 values = client.read_and_wait([p["id"] for p in properties], timeout=10.0)
 print(values)  # {property_id: value, ...} — partial if not everything arrived in time
@@ -68,7 +70,7 @@ print(values)  # {property_id: value, ...} — partial if not everything arrived
 client.disconnect()
 ```
 
-`on_disconnect` fires only when the connection drops unexpectedly (a broken socket, or the device closing its end) — a caller-initiated `disconnect()` never triggers it. `client.is_connected` is the polling-style equivalent, for a periodic check rather than an event callback.
+`on_disconnect` fires only when the connection drops unexpectedly (a broken socket, the device closing its end, or a heartbeat-reply or property-push timeout) — a caller-initiated `disconnect()` never triggers it. `client.is_connected` is the polling-style equivalent, for a periodic check rather than an event callback.
 
 ## Things learned from real hardware that aren't obvious from the protocol alone
 
