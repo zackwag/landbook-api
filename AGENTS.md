@@ -55,8 +55,10 @@ don't hand-edit `pyproject.toml`'s `version`, `__version__`, or
 `CHANGELOG.md`, and don't touch `chore(main): release ...` PRs. See
 CONTRIBUTING.md for the full sequence.
 
-landbook-ha pins `landbook-api>=X.Y.Z`, so a release reaches its users
-immediately: never remove or change public API, or private attributes
-landbook-ha is known to touch, without a compatibility path. Flag in your
-PR description if landbook-ha needs a corresponding change or
-`requirements` bump once the release goes out.
+A release reaches landbook-ha users only when landbook-ha bumps the
+`landbook-api` pin in its `manifest.json`: Home Assistant skips installing
+a requirement that the installed version already satisfies. Don't remove
+or change public API, or private attributes landbook-ha is known to touch,
+until the landbook-ha version that pins the release no longer uses them.
+Flag in your PR description if landbook-ha needs a corresponding change
+or pin bump once the release goes out.

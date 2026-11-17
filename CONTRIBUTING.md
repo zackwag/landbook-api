@@ -53,4 +53,4 @@ Releases are cut by [release-please](https://github.com/googleapis/release-pleas
 
 PR titles must follow [Conventional Commits](https://www.conventionalcommits.org/) (enforced in CI) because the squash-merge commit drives the release: `feat:` bumps the minor version, `!` marks a breaking change, and `fix:`, `perf:`, `refactor:`, `revert:` and `chore:` all cut a patch release (see `release-please-config.json`). Only `docs:`, `ci:`, `test:` and `build:` merge without releasing. Merging to `main` opens or updates a `chore(main): release X.Y.Z` PR; merging that PR tags `vX.Y.Z`, which triggers `.github/workflows/release.yml` to run the tests, build, and publish to PyPI.
 
-landbook-ha pins `landbook-api>=X.Y.Z`, so a release reaches existing installs as soon as it's on PyPI. If landbook-ha needs your change, it also needs its `requirements` pin bumped once the release is out.
+A release reaches landbook-ha users only when landbook-ha bumps the `landbook-api` pin in its `manifest.json`, because Home Assistant skips installing a requirement that the installed version already satisfies. If landbook-ha needs your change, bump that pin once the release is out.
