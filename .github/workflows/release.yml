@@ -36,3 +36,19 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true
+
+  # Opens a landbook-ha PR bumping its exact landbook-api pin, which is the
+  # only way a release reaches its users. Needs LANDBOOK_HA_TOKEN: a
+  # fine-grained token with Contents and Pull requests read/write on
+  # zackwag/landbook-ha.
+  bump-landbook-ha:
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Open the landbook-ha bump PR
+        env:
+          GH_TOKEN: ${{ secrets.LANDBOOK_HA_TOKEN }}
+        run: VERSION="${GITHUB_REF_NAME#v}" .github/scripts/bump-landbook-ha.sh
