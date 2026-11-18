@@ -47,10 +47,13 @@ followed by a type-dependent value:
 
 from __future__ import annotations
 
+import logging
 import struct
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
 
 SYNC = b"\xaa\xaa"
 
@@ -87,61 +90,51 @@ class DecodedFrame:
 # TSL dataType -> TTLV wire type
 # ----------------------------------------------------------------------
 
-# Maps the `dataType` string on a TSL property (from api.get_tsl) to the
-# TTLV wire type used to encode/decode its value locally. Source: the app's
-# DataModelConvertUtil field-encoder dispatch (dataType "1"=BOOL,
-# "2"/"3"/"4"/"5"/"7"=numeric family, "6"=TEXT, "8"/"9"=STRUCT/ARRAY,
-# "11"=RAW hex). "8"/"9" (nested struct/array properties) aren't mapped
-# here — build a TYPE_STRUCT TTLVField with a `value` list of nested
-# TTLVFields directly if a device ever needs one; no OmniBreeze fan
-# property observed so far has used them.
-_DATATYPE_TO_TTLV_TYPE = {
-    "1": None,  # bool — caller picks TYPE_BOOL_TRUE/FALSE from the value itself
-    "2": TYPE_NUMBER,
-    "3": TYPE_NUMBER,
-    "4": TYPE_NUMBER,
-    "5": TYPE_NUMBER,
-    "7": TYPE_NUMBER,
-    "6": TYPE_BYTES,
-    "11": TYPE_RAW_HEX,
+# Real productTSL responses name a property's `dataType` ("BOOL", "ENUM",
+# "INT", ... — confirmed against a real device). The app's local-protocol
+# dispatch also accepts short numeric-string codes for the same types
+# (DataModelConvertUtil: "1"=BOOL, "2"/"3"/"4"/"5"/"7"=numeric, "6"=TEXT,
+# "8"/"9"=STRUCT/ARRAY, "11"=RAW), so both forms are accepted here.
+_DATATYPE_CODE_TO_NAME = {
+    "1": "BOOL",
+    "2": "INT",
+    "3": "FLOAT",
+    "4": "DOUBLE",
+    "5": "ENUM",
+    "6": "TEXT",
+    "7": "DATE",
+    "8": "STRUCT",
+    "9": "ARRAY",
+    "11": "RAW",
 }
 
-# The real userDeviceList/productTSL REST responses use human-readable
-# dataType names (confirmed against a real device: "BOOL", "ENUM", "INT"),
-# not the short numeric-string codes above — those numeric codes are an
-# internal convention the app's local-protocol dispatch normalizes named
-# types down to before it ever reaches the TTLV encoder (its cloud-JSON
-# path accepts both forms interchangeably, e.g.
-# `dataType.equalsIgnoreCase("2") || dataType.equalsIgnoreCase("INT")`).
-# Accept either form here too, case-insensitively.
-_DATATYPE_NAME_TO_CODE = {
-    "BOOL": "1",
-    "INT": "2",
-    "FLOAT": "3",
-    "DOUBLE": "4",
-    "ENUM": "5",
-    "TEXT": "6",
-    "DATE": "7",
-    "STRUCT": "8",
-    "ARRAY": "9",
-    "RAW": "11",
+# BOOL isn't here: its value is carried by the type itself (TYPE_BOOL_TRUE /
+# TYPE_BOOL_FALSE). STRUCT/ARRAY aren't either — no observed device uses
+# them; build a TYPE_STRUCT TTLVField with nested TTLVFields directly if one
+# ever does.
+_TTLV_TYPE_BY_DATATYPE = {
+    "INT": TYPE_NUMBER,
+    "FLOAT": TYPE_NUMBER,
+    "DOUBLE": TYPE_NUMBER,
+    "ENUM": TYPE_NUMBER,
+    "DATE": TYPE_NUMBER,
+    "TEXT": TYPE_BYTES,
+    "RAW": TYPE_RAW_HEX,
 }
-
-
-def _normalize_data_type(data_type: str) -> str:
-    return _DATATYPE_NAME_TO_CODE.get(data_type.upper(), data_type)
 
 
 def field_for_property(prop_id: int, data_type: str, value: Any) -> TTLVField:
-    """Build a TTLVField for a TSL property's numeric `id` (NOT its string
-    `code` — that's only used by the cloud MQTT JSON protocol), `dataType`
-    (either form — "BOOL"/"ENUM"/"INT"/... as the real API returns it, or
-    the internal "1"/"5"/"2"/... numeric-string codes), and current value.
+    """Build a TTLVField for a TSL property.
+
+    `prop_id` is the property's numeric `id` (NOT its string `code` — that's
+    only used by the cloud MQTT JSON protocol). `data_type` is its
+    `dataType`, as a name ("BOOL", "ENUM", ..., case-insensitive) or a
+    numeric-string code ("1", "5", ...).
     """
-    data_type = _normalize_data_type(data_type)
-    if data_type == "1":
+    name = _DATATYPE_CODE_TO_NAME.get(data_type, data_type.upper())
+    if name == "BOOL":
         return TTLVField(prop_id, TYPE_BOOL_TRUE if value else TYPE_BOOL_FALSE, None)
-    ttlv_type = _DATATYPE_TO_TTLV_TYPE.get(data_type)
+    ttlv_type = _TTLV_TYPE_BY_DATATYPE.get(name)
     if ttlv_type is None:
         raise ProtocolError(f"unsupported TSL dataType for local control: {data_type!r}")
     return TTLVField(prop_id, ttlv_type, value)
@@ -153,37 +146,43 @@ def field_for_property(prop_id: int, data_type: str, value: Any) -> TTLVField:
 
 
 def _encode_number(value: float) -> bytes:
+    sign = 1 if value < 0 else 0
     if isinstance(value, float):
-        sign = 1 if value < 0 else 0
         text = f"{abs(value):.15f}".rstrip("0").rstrip(".")
         int_part, _, frac_part = text.partition(".")
         count = len(frac_part)
-        digits = (int_part + frac_part) or "0"
-        magnitude = int(digits)
+        magnitude = int((int_part + frac_part) or "0")
     else:
-        sign = 1 if value < 0 else 0
-        magnitude = abs(int(value))
         count = 0
+        magnitude = abs(int(value))
 
     if count > 0xF:
         raise ProtocolError(f"value has too many decimal digits for TTLV encoding: {value!r}")
-
-    value_bytes = magnitude.to_bytes(8, "big").lstrip(b"\x00") or b"\x00"
-    if len(value_bytes) > 8:
+    if magnitude.bit_length() > 64:
         raise ProtocolError(f"value too large for TTLV numeric encoding: {value!r}")
 
+    value_bytes = magnitude.to_bytes(8, "big").lstrip(b"\x00") or b"\x00"
     marker = (sign << 7) | ((count & 0xF) << 3) | (len(value_bytes) - 1)
     return bytes([marker]) + value_bytes
 
 
+def _take(data: bytes, offset: int, n: int) -> bytes:
+    if offset + n > len(data):
+        raise ProtocolError("truncated TTLV field")
+    return data[offset : offset + n]
+
+
+def _take_u16(data: bytes, offset: int) -> int:
+    return struct.unpack(">H", _take(data, offset, 2))[0]
+
+
 def _decode_number(data: bytes, offset: int) -> tuple[int | float, int]:
-    marker = data[offset]
+    marker = _take(data, offset, 1)[0]
     sign = (marker >> 7) & 0x1
     count = (marker >> 3) & 0xF
     nbytes = (marker & 0x7) + 1
-    start = offset + 1
-    end = start + nbytes
-    magnitude = int.from_bytes(data[start:end], "big")
+    end = offset + 1 + nbytes
+    magnitude = int.from_bytes(_take(data, offset + 1, nbytes), "big")
     if sign:
         magnitude = -magnitude
     if count:
@@ -226,24 +225,21 @@ def encode_id_list(ids: list[int]) -> bytes:
 def _decode_one_field(data: bytes, offset: int, depth: int) -> tuple[TTLVField, int]:
     if depth > _MAX_STRUCT_DEPTH:
         raise ProtocolError("TTLV struct nesting too deep")
-    if offset + 2 > len(data):
-        raise ProtocolError("truncated TTLV field header")
-    header = struct.unpack_from(">H", data, offset)[0]
+    header = _take_u16(data, offset)
     field_id = (header >> 3) & 0x1FFF
     field_type = header & 0x7
     offset += 2
 
     if field_type in (TYPE_BYTES, TYPE_RAW_HEX):
-        length = struct.unpack_from(">H", data, offset)[0]
-        offset += 2
-        value: Any = bytes(data[offset : offset + length])
-        offset += length
+        length = _take_u16(data, offset)
+        value: Any = bytes(_take(data, offset + 2, length))
+        offset += 2 + length
     elif field_type in (TYPE_BOOL_FALSE, TYPE_BOOL_TRUE):
         value = field_type == TYPE_BOOL_TRUE
     elif field_type == TYPE_NUMBER:
         value, offset = _decode_number(data, offset)
     elif field_type == TYPE_STRUCT:
-        count = struct.unpack_from(">H", data, offset)[0]
+        count = _take_u16(data, offset)
         offset += 2
         items = []
         for _ in range(count):
@@ -257,6 +253,7 @@ def _decode_one_field(data: bytes, offset: int, depth: int) -> tuple[TTLVField, 
 
 
 def decode_fields(data: bytes) -> list[TTLVField]:
+    """Decode a TTLV payload. Raises ProtocolError for any malformed input."""
     offset = 0
     fields = []
     while offset < len(data):
@@ -275,9 +272,7 @@ def _checksum(data: bytes) -> int:
 
 
 def _stuff(frame: bytes) -> bytes:
-    # The literal 2-byte sync marker (and the byte immediately after it) is
-    # never a stuffing candidate — only pairs starting at offset 2 onward
-    # are escaped, matching the encoder this mirrors.
+    # The sync marker itself is never escaped, matching the app's encoder.
     out = bytearray(frame[:2])
     i = 2
     n = len(frame)
@@ -307,7 +302,7 @@ def _unstuff(data: bytes) -> bytes:
 def encode_frame(cmd: int, payload: bytes, packet_id: int) -> bytes:
     body = struct.pack(">HH", packet_id & 0xFFFF, cmd & 0xFFFF) + payload
     checksum = _checksum(body)
-    length_field = len(body) + 1  # + the checksum byte itself
+    length_field = len(body) + 1
     frame = SYNC + struct.pack(">H", length_field) + bytes([checksum]) + body
     return _stuff(frame)
 
@@ -328,7 +323,9 @@ class FrameDecoder:
     de-stuffed independently before being appended to a persistent buffer,
     then complete frames are sliced off the front of that buffer as they
     become available. Feed it whatever bytes a socket read produces, in
-    order; get back zero or more fully-decoded frames.
+    order; get back zero or more fully-decoded frames. A malformed frame
+    (bad length or checksum) is logged and skipped, not raised, so it can't
+    hold up the valid frames behind it.
     """
 
     def __init__(self) -> None:
@@ -338,7 +335,11 @@ class FrameDecoder:
         self._buf.extend(_unstuff(chunk))
         frames = []
         while True:
-            frame = self._try_extract_one()
+            try:
+                frame = self._try_extract_one()
+            except ProtocolError as exc:
+                _LOGGER.warning("Landbook local: dropping malformed frame: %s", exc)
+                continue
             if frame is None:
                 break
             frames.append(frame)
@@ -360,6 +361,9 @@ class FrameDecoder:
         if len(self._buf) < 9:
             return None
         length_field = struct.unpack_from(">H", self._buf, 2)[0]
+        if length_field < 5:
+            del self._buf[:2]
+            raise ProtocolError(f"frame length field too small: {length_field}")
         total = length_field + 4
         if len(self._buf) < total:
             return None

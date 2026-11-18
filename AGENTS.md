@@ -2,9 +2,10 @@
 
 ## Honor the API/HA split
 
-This repo is a standalone client for the Landbook cloud API — REST auth and
-device discovery (`landbook_api/api.py`) and the MQTT pub/sub connection
-(`landbook_api/mqtt_client.py`, `LandbookMQTTClient`). It has **no
+This repo is a standalone client for Landbook devices — REST auth and
+device discovery (`landbook_api/api.py`), the cloud MQTT pub/sub connection
+(`landbook_api/mqtt_client.py`, `LandbookMQTTClient`), and direct local-LAN
+control (`landbook_api/local_client.py`, `local_protocol.py`). It has **no
 dependency on Home Assistant** and must never acquire one: no
 `homeassistant` imports, no config-entry/entity/options concepts, nothing
 that assumes a specific caller.
@@ -37,8 +38,9 @@ these directly instead of reimplementing them.
 
 ## Testing
 
-- `tests/test_mqtt.py` and `tests/test_api.py` mock at the transport
-  boundary (`paho.mqtt.client.Client`, `urllib.request.urlopen`), not this
+- Tests mock at the transport boundary (`urllib.request.urlopen`,
+  `paho.mqtt.client.Client` via `Broker` in `tests/test_mqtt.py`, the
+  socket via `FakeDevice` in `tests/test_local_client.py`), not this
   library's own internals — new tests should do the same so they exercise
   real code paths.
 - Add or extend tests for any behavior change here, even if the immediate
@@ -48,8 +50,15 @@ these directly instead of reimplementing them.
 
 ## Releases
 
-A merged PR isn't consumable by landbook-ha until it's released: bump
-`pyproject.toml`'s `version`, add a `CHANGELOG.md` entry, then push a
-`vX.Y.Z` tag to trigger the publish workflow. See CONTRIBUTING.md for the
-full sequence, and flag in your PR description if landbook-ha needs a
-corresponding `requirements` bump once the release goes out.
+Releases are cut by release-please from Conventional Commit PR titles —
+don't hand-edit `pyproject.toml`'s `version`, `__version__`, or
+`CHANGELOG.md`, and don't touch `chore(main): release ...` PRs. See
+CONTRIBUTING.md for the full sequence.
+
+A release reaches landbook-ha users only when landbook-ha bumps the
+`landbook-api` pin in its `manifest.json`: Home Assistant skips installing
+a requirement that the installed version already satisfies. Don't remove
+or change public API, or private attributes landbook-ha is known to touch,
+until the landbook-ha version that pins the release no longer uses them.
+Flag in your PR description if landbook-ha needs a corresponding change
+or pin bump once the release goes out.

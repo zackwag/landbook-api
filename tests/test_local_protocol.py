@@ -105,9 +105,8 @@ class TestStructRoundTrip:
         assert decoded == [TTLVField(10, TYPE_STRUCT, [])]
 
     def test_deeply_nested_struct_rejected(self):
-        # 21 levels of nesting exceeds the 20-level guard
         inner = [TTLVField(1, TYPE_BOOL_TRUE, None)]
-        for depth in range(21):
+        for _ in range(21):
             inner = [TTLVField(1, TYPE_STRUCT, inner)]
         encoded = encode_fields([TTLVField(1, TYPE_STRUCT, inner)])
         with pytest.raises(ProtocolError):
@@ -128,6 +127,34 @@ class TestMultipleFields:
             TTLVField(3, TYPE_BYTES, b"x"),
         ]
         assert decode_fields(encoded) == expected
+
+
+class TestMalformedInput:
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"\x00",  # half a field header
+            b"\x00\x0a",  # number field with no marker byte
+            b"\x00\x0a\x01\x00",  # number marker promising 2 value bytes, 1 present
+            b"\x00\x0b\x00",  # bytes field with half a length prefix
+            b"\x00\x0b\x00\x05ab",  # bytes field shorter than its length prefix
+            b"\x00\x0c",  # struct field with no count
+            b"\x00\x0c\x00\x02\x00\x09",  # struct promising 2 fields, 1 present
+            b"\x00\x0e",  # unknown wire type 6
+        ],
+    )
+    def test_decode_raises_protocol_error(self, data):
+        with pytest.raises(ProtocolError):
+            decode_fields(data)
+
+    def test_number_wider_than_64_bits_raises_protocol_error(self):
+        with pytest.raises(ProtocolError):
+            encode_field(TTLVField(1, TYPE_NUMBER, 2**64))
+
+    def test_frame_length_too_small_is_dropped_without_losing_the_next_frame(self):
+        bad = b"\xaa\xaa\x00\x01\x00\x00\x00\x00\x00"
+        good = encode_frame(cmd=17, payload=b"x", packet_id=1)
+        assert [d.cmd for d in FrameDecoder().feed(bad + good)] == [17]
 
 
 class TestIdList:
@@ -189,9 +216,15 @@ class TestFrameRoundTrip:
         assert decoded[0].cmd == 28722
         assert decoded[0].payload == b""
 
-    def test_frame_starts_with_sync(self):
-        frame = encode_frame(cmd=1, payload=b"", packet_id=1000)
-        assert frame.startswith(SYNC)
+    def test_frame_bytes_match_wire_format(self):
+        # AA AA | length=7 | checksum=sum(03 E8 00 11 00 01)=FD | packetId | cmd | payload
+        frame = encode_frame(cmd=17, payload=b"\x00\x01", packet_id=1000)
+        assert frame.hex() == "aaaa0007fd03e800110001"
+
+    def test_stuffing_bytes_match_wire_format(self):
+        # The first payload AA is followed by AA, so a 55 is inserted after it.
+        frame = encode_frame(cmd=1, payload=b"\xaa\xaa", packet_id=1)
+        assert frame.hex() == "aaaa00075600010001aa55aa"
 
     def test_multiple_frames_in_one_feed(self):
         frame1 = encode_frame(cmd=17, payload=b"a", packet_id=1000)
@@ -227,11 +260,11 @@ class TestFrameRoundTrip:
         assert len(decoded) == 1
         assert decoded[0].cmd == 17
 
-    def test_checksum_mismatch_raises(self):
-        frame = bytearray(encode_frame(cmd=17, payload=b"x", packet_id=1))
-        frame[4] ^= 0xFF  # corrupt the checksum byte
-        with pytest.raises(ProtocolError):
-            FrameDecoder().feed(bytes(frame))
+    def test_checksum_mismatch_is_dropped_without_losing_the_next_frame(self):
+        bad = bytearray(encode_frame(cmd=17, payload=b"x", packet_id=1))
+        bad[4] ^= 0xFF  # the checksum byte
+        good = encode_frame(cmd=19, payload=b"y", packet_id=2)
+        assert [d.cmd for d in FrameDecoder().feed(bytes(bad) + good)] == [19]
 
     def test_payload_containing_sync_like_bytes_round_trips(self):
         # Payload deliberately contains AA-AA and AA-55 sequences that would
@@ -239,7 +272,7 @@ class TestFrameRoundTrip:
         # stuffing weren't applied and reversed correctly.
         tricky_payload = b"\xaa\xaa\xaa\x55\x00\xaa"
         frame = encode_frame(cmd=99, payload=tricky_payload, packet_id=42)
-        assert frame != SYNC + tricky_payload  # sanity: stuffing actually changed something
+        assert SYNC not in frame[2:]
         decoded = FrameDecoder().feed(frame)
         assert len(decoded) == 1
         assert decoded[0].payload == tricky_payload
