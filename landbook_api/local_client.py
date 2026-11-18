@@ -113,6 +113,11 @@ HEARTBEAT_PONG_TIMEOUT = 30.0
 # attached" failure mode where heartbeat replies keep flowing but the device
 # stops its spontaneous property-push cycle.
 DATA_STALL_TIMEOUT = 90.0
+# A quiet device can still be healthy: on a p11vkW, a status read after 92s
+# of property silence got fresh properties back in 0.13s on the same
+# connection. So a stall first sends one read, and tears down only if no
+# property frame answers within one heartbeat interval.
+DATA_PROBE_TIMEOUT = 15.0
 
 _PACKET_ID_START = 1000
 _PACKET_ID_WRAP = 65535
@@ -250,6 +255,11 @@ class LandbookLocalClient:
         # fed by status pushes and read/write responses as the device sends
         # them on its own schedule.
         self.properties: dict[int, Any] = {}
+        # Bumped per id on every report, so write_and_confirm() can tell a
+        # fresh report from a cached value that already matched.
+        self._property_revision: dict[int, int] = {}
+        # When the pending data-stall probe was sent; None when none is.
+        self._data_probe_started: float | None = None
         self._write_acks = 0
         # Acks don't identify the write they answer, so confirmed writes go
         # one at a time to attribute each ack to exactly one caller.
@@ -289,10 +299,15 @@ class LandbookLocalClient:
         """Open the TCP connection and complete the login handshake
         (blocking until logged in, login is rejected, or `timeout` elapses).
 
-        Any existing connection is closed first. Raises ConnectionError if
-        login fails or times out.
+        Any existing connection is closed first, and `properties` is
+        cleared: values from a previous session may be stale. Raises
+        ConnectionError if login fails or times out.
         """
         self.disconnect()
+        with self._state_changed:
+            self.properties.clear()
+            self._property_revision.clear()
+            self._data_probe_started = None
         sock = socket.create_connection((self._ip, self._port), timeout=5.0)
         sock.settimeout(0.5)
         self._login_done.clear()
@@ -376,6 +391,42 @@ class LandbookLocalClient:
                 acks_before = self._write_acks
             self.write(fields)
             return self._wait_for(lambda: self._write_acks > acks_before, timeout)
+
+    def write_and_confirm(self, fields: list[TTLVField], timeout: float = 10.0) -> bool:
+        """Write property values, request them back, and wait up to
+        *timeout* seconds for the device to report every one of them anew
+        with the written value.
+
+        Stricter than write_and_wait(): an ack, a heartbeat reply, or a
+        cached value that already matched doesn't count. False means
+        unconfirmed, not necessarily unapplied, so only retry idempotent
+        assignments on another path.
+
+        Holds the same lock as write_and_wait() for the whole wait, so
+        concurrent confirmed writes (e.g. fan speed and light together) run
+        one after another, each blocking the next for up to *timeout*.
+        Sharing the lock keeps this write's ack from being counted by a
+        concurrent write_and_wait().
+        """
+        if not fields:
+            return False
+        # Round-trip through the wire format so the comparison sees what the
+        # device will report: a bool lives in the TTLV type (its value may
+        # be None), and numbers carry the wire's precision.
+        expected = {f.id: f.value for f in decode_fields(encode_fields(fields))}
+        with self._confirmed_write_lock:
+            with self._state_changed:
+                revisions = {i: self._property_revision.get(i, 0) for i in expected}
+            self.write(fields)
+            self.read(list(expected))
+            return self._wait_for(
+                lambda: all(
+                    self._property_revision.get(i, 0) > revisions[i]
+                    and self.properties.get(i) == value
+                    for i, value in expected.items()
+                ),
+                timeout,
+            )
 
     # ------------------------------------------------------------------
     # Internal
@@ -494,10 +545,16 @@ class LandbookLocalClient:
         self._login_done.set()
 
     def _on_data(self, fields: list[TTLVField]) -> None:
+        # An empty frame carries no properties, so it's no evidence the
+        # data plane is alive.
+        if not fields:
+            return
         with self._state_changed:
             self.last_property_update = time.monotonic()
+            self._data_probe_started = None
             for f in fields:
                 self.properties[f.id] = f.value
+                self._property_revision[f.id] = self._property_revision.get(f.id, 0) + 1
             self._state_changed.notify_all()
         if self.on_update:
             self.on_update(fields)
@@ -530,12 +587,29 @@ class LandbookLocalClient:
             _close_quietly(sock)
             return
         if now - self.last_property_update > DATA_STALL_TIMEOUT:
-            _LOGGER.warning(
-                "Landbook local: data stall (no property push in %.0fs), tearing down",
-                now - self.last_property_update,
-            )
-            _close_quietly(sock)
-            return
+            with self._state_changed:
+                ids = list(self.properties)
+                probe_started = self._data_probe_started
+                if probe_started is None and ids:
+                    self._data_probe_started = now
+            # With no known ids there's nothing to probe for.
+            if not ids or (probe_started is not None and now - probe_started >= DATA_PROBE_TIMEOUT):
+                _LOGGER.warning(
+                    "Landbook local: data stall (no property push in %.0fs), tearing down",
+                    now - self.last_property_update,
+                )
+                _close_quietly(sock)
+                return
+            if probe_started is None:
+                # Pongs only prove the heartbeat handler is alive, so ask for
+                # real properties. Not read_and_wait(): cached values would
+                # satisfy it immediately.
+                _LOGGER.debug("Landbook local: property silence, requesting fresh status")
+                try:
+                    self.read(ids)
+                except OSError:
+                    _close_quietly(sock)
+                    return
         try:
             self._send(CMD_HEARTBEAT_PING, b"")
         except OSError:

@@ -55,6 +55,8 @@ class FakeDevice:
         self.accept_result = 0
         self.ack_writes: bool | int = True  # an int acks only that many writes
         self.ack_delay = 0.0
+        self.read_reply: list[TTLVField] | None = None  # pushed back for each read
+        self.fail_reads = False
         self.received: list[tuple[int, list[TTLVField] | bytes]] = []
         self.closed = False
         self._inbox: queue.Queue[bytes] = queue.Queue()
@@ -110,7 +112,11 @@ class FakeDevice:
         if self._session_iv is not None:
             payload = unpad(self._cipher().decrypt(payload), AES.block_size)
         if cmd == lc.CMD_READ:
+            if self.fail_reads:
+                raise OSError(32, "Broken pipe")
             self.received.append((cmd, payload))
+            if self.read_reply is not None:
+                self.push(lc.CMD_READ_WRITE_RESP, self.read_reply)
             return
         fields = decode_fields(payload)
         self.received.append((cmd, fields))
@@ -307,6 +313,12 @@ class TestLogin:
         assert device.all[-1] is not device
         assert on_disconnect == []
 
+    def test_reconnecting_clears_properties_from_the_previous_session(self, device, connected):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        connected.connect(timeout=2.0)
+        assert connected.properties == {}
+
 
 class TestReadWrite:
     def test_write_sends_encrypted_fields(self, device, connected):
@@ -426,6 +438,53 @@ class TestPropertyCache:
         assert connected.properties == {2: 2}
 
 
+class TestWriteAndConfirm:
+    @pytest.mark.parametrize(
+        ("reply", "confirmed"),
+        [
+            # Bools live in the TTLV type, so a None-valued write must match.
+            ([TTLVField(1, TYPE_BOOL_TRUE, None)], True),
+            ([TTLVField(1, TYPE_NUMBER, 0)], False),  # different value
+            ([TTLVField(2, TYPE_NUMBER, 5)], False),  # unrelated property
+            (None, False),  # write ack only, no fresh report
+        ],
+    )
+    def test_needs_a_fresh_matching_report(self, device, connected, reply, confirmed):
+        device.read_reply = reply
+        written = [TTLVField(1, TYPE_BOOL_TRUE, None)]
+        assert connected.write_and_confirm(written, timeout=0.2) is confirmed
+        assert device.sent(lc.CMD_WRITE) == [[TTLVField(1, TYPE_BOOL_TRUE, True)]]
+        assert len(device.sent(lc.CMD_READ)) == 1
+
+    def test_cached_matching_value_does_not_confirm(self, device, connected):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_BOOL_TRUE, None)])
+        assert wait_until(lambda: 1 in connected.properties)
+        assert not connected.write_and_confirm([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=0.1)
+
+    @pytest.mark.parametrize(
+        ("reply", "confirmed"),
+        [
+            ([TTLVField(1, TYPE_NUMBER, 3), TTLVField(2, TYPE_BOOL_TRUE, None)], True),
+            ([TTLVField(1, TYPE_NUMBER, 3), TTLVField(2, TYPE_NUMBER, 0)], False),
+            ([TTLVField(1, TYPE_NUMBER, 3)], False),
+        ],
+    )
+    def test_every_written_field_must_be_confirmed(self, device, connected, reply, confirmed):
+        device.read_reply = reply
+        written = [TTLVField(1, TYPE_NUMBER, 3), TTLVField(2, TYPE_BOOL_TRUE, None)]
+        assert connected.write_and_confirm(written, timeout=0.2) is confirmed
+
+    def test_empty_write_is_unconfirmed_and_sends_nothing(self, device, connected):
+        assert not connected.write_and_confirm([])
+        assert device.sent(lc.CMD_WRITE) == []
+
+    def test_returns_early_when_connection_drops(self, device, connected):
+        later(0.05, device.hang_up)
+        start = time.monotonic()
+        assert not connected.write_and_confirm([TTLVField(1, TYPE_NUMBER, 3)], timeout=5.0)
+        assert time.monotonic() - start < 2.0
+
+
 class TestReadAndWait:
     def test_returns_cached_values(self, device, connected):
         device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
@@ -488,6 +547,63 @@ class TestHeartbeat:
         timers[0].fire()
         assert fired.wait(2.0)
         assert not connected.is_connected
+        assert device.sent(lc.CMD_HEARTBEAT_PING) == []
+
+    def test_quiet_session_is_probed_before_teardown(self, device, connected, timers, monkeypatch):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        monkeypatch.setattr(lc, "DATA_STALL_TIMEOUT", -1.0)
+        timers[0].fire()
+        assert device.sent(lc.CMD_READ) == [lc.encode_id_list([1])]
+        assert device.sent(lc.CMD_HEARTBEAT_PING) == [[]]
+        assert connected.is_connected
+
+    def test_fresh_properties_answer_the_probe(self, device, connected, timers, monkeypatch):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        monkeypatch.setattr(lc, "DATA_STALL_TIMEOUT", -1.0)
+        monkeypatch.setattr(lc, "DATA_PROBE_TIMEOUT", 0.0)
+        device.read_reply = [TTLVField(1, TYPE_NUMBER, 1)]  # unchanged value still counts
+        updates = []
+        connected.on_update = updates.append
+        timers[0].fire()
+        assert wait_until(lambda: updates)
+        timers[1].fire()
+        # Still stalled, so it probes again rather than tearing down.
+        assert len(device.sent(lc.CMD_READ)) == 2
+        assert connected.is_connected
+
+    @pytest.mark.parametrize("reply", ["pong", "ack", "empty", "malformed"])
+    def test_only_properties_answer_the_probe(self, device, connected, timers, monkeypatch, reply):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        monkeypatch.setattr(lc, "DATA_STALL_TIMEOUT", -1.0)
+        monkeypatch.setattr(lc, "DATA_PROBE_TIMEOUT", 0.0)
+        fired = threading.Event()
+        connected.on_disconnect = fired.set
+        timers[0].fire()
+        if reply == "pong":
+            device.push_raw(lc.CMD_HEARTBEAT_REPLY, b"")
+        elif reply == "ack":
+            device.push(lc.CMD_WRITE_ACK, [TTLVField(1, TYPE_NUMBER, 0)])
+        elif reply == "empty":
+            device.push(lc.CMD_STATUS_PUSH_OBSERVED, [])
+        else:
+            device.push_raw(lc.CMD_STATUS_PUSH_OBSERVED, b"\x00\x0b")
+        time.sleep(0.1)
+        timers[1].fire()
+        assert fired.wait(2.0)
+        assert not connected.is_connected
+
+    def test_probe_send_failure_tears_down(self, device, connected, timers, monkeypatch):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        monkeypatch.setattr(lc, "DATA_STALL_TIMEOUT", -1.0)
+        device.fail_reads = True
+        fired = threading.Event()
+        connected.on_disconnect = fired.set
+        timers[0].fire()
+        assert fired.wait(2.0)
         assert device.sent(lc.CMD_HEARTBEAT_PING) == []
 
     def test_pong_and_data_keep_the_connection_alive(self, device, connected, timers, monkeypatch):
