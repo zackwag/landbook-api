@@ -1,509 +1,618 @@
 import base64
+import queue
 import threading
 import time
-from unittest.mock import MagicMock, patch
 
 import pytest
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
 
-from landbook_api.local_client import (
-    CMD_HEARTBEAT_PING,
-    CMD_HEARTBEAT_REPLY,
-    CMD_HEARTBEAT_START,
-    CMD_READ,
-    CMD_STATUS_PUSH_OBSERVED,
-    CMD_WRITE_ACK,
-    DATA_PROBE_TIMEOUT,
-    DATA_STALL_TIMEOUT,
-    HEARTBEAT_PONG_TIMEOUT,
-    LandbookLocalClient,
-    _parse_discovery_reply,
-)
+from landbook_api import local_client as lc
+from landbook_api.local_client import LandbookLocalClient, discover_devices
 from landbook_api.local_protocol import (
     TYPE_BOOL_TRUE,
     TYPE_BYTES,
     TYPE_NUMBER,
-    DecodedFrame,
     FrameDecoder,
     TTLVField,
+    decode_fields,
     encode_fields,
+    encode_frame,
 )
 
-AUTH_KEY_B64 = base64.b64encode(b"0123456789abcdef").decode()
+AUTH_KEY = b"0123456789abcdef"
+AUTH_KEY_B64 = base64.b64encode(AUTH_KEY).decode()
+CHALLENGE = "abcdefghijklmnop"
+# SHA-256 of "<hex(AUTH_KEY)>;<CHALLENGE>", the login signature the device expects.
+EXPECTED_LOGIN_SIGN = "d4c900a5568b2911ee807a3b5fb31d7d23c296629a0cb1b1732760357f02c8f1"
+
+
+def later(delay, fn, *args):
+    def run():
+        time.sleep(delay)
+        fn(*args)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def wait_until(predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+class FakeDevice:
+    """Stands in for the TCP socket to a device: decodes what the client
+    sends, answers the login handshake and writes like real hardware, and
+    lets tests push frames back."""
+
+    def __init__(self, auth_key=AUTH_KEY):
+        self.auth_key = auth_key
+        self.answer_challenge = True
+        self.accept_result = 0
+        self.ack_writes: bool | int = True  # an int acks only that many writes
+        self.ack_delay = 0.0
+        self.read_reply: list[TTLVField] | None = None  # pushed back for each read
+        self.fail_reads = False
+        self.received: list[tuple[int, list[TTLVField] | bytes]] = []
+        self.closed = False
+        self._inbox: queue.Queue[bytes] = queue.Queue()
+        self._decoder = FrameDecoder()
+        self._session_iv: bytes | None = None
+        self._packet_id = 1
+
+    # -- socket API used by the client --
+
+    def settimeout(self, _timeout):
+        pass
+
+    def sendall(self, data):
+        if self.closed:
+            raise OSError(9, "Bad file descriptor")
+        for frame in self._decoder.feed(data):
+            self._on_frame(frame.cmd, frame.payload)
+
+    def recv(self, _n):
+        if self.closed:
+            raise OSError(9, "Bad file descriptor")
+        try:
+            return self._inbox.get(timeout=0.02)
+        except queue.Empty:
+            raise TimeoutError from None
+
+    def close(self):
+        self.closed = True
+
+    # -- test controls --
+
+    def push(self, cmd, fields):
+        self.push_raw(cmd, encode_fields(fields))
+
+    def push_raw(self, cmd, payload, encrypt=True):
+        if encrypt and self._session_iv is not None:
+            payload = self._cipher().encrypt(pad(payload, AES.block_size))
+        self._packet_id += 1
+        self._inbox.put(encode_frame(cmd, payload, self._packet_id))
+
+    def hang_up(self):
+        self._inbox.put(b"")
+
+    def sent(self, cmd):
+        return [payload for c, payload in self.received if c == cmd]
+
+    # -- device behavior --
+
+    def _cipher(self):
+        return AES.new(self.auth_key, AES.MODE_CBC, self._session_iv)
+
+    def _on_frame(self, cmd, payload):
+        if self._session_iv is not None:
+            payload = unpad(self._cipher().decrypt(payload), AES.block_size)
+        if cmd == lc.CMD_READ:
+            if self.fail_reads:
+                raise OSError(32, "Broken pipe")
+            self.received.append((cmd, payload))
+            if self.read_reply is not None:
+                self.push(lc.CMD_READ_WRITE_RESP, self.read_reply)
+            return
+        fields = decode_fields(payload)
+        self.received.append((cmd, fields))
+        if cmd == lc.CMD_REQUEST_RANDOM and self.answer_challenge:
+            self.push(lc.CMD_RANDOM_REPLY, [TTLVField(1, TYPE_BYTES, CHALLENGE.encode())])
+        elif cmd == lc.CMD_LOGIN:
+            accepted = self.auth_key == AUTH_KEY and fields == [
+                TTLVField(2, TYPE_BYTES, EXPECTED_LOGIN_SIGN.encode())
+            ]
+            result = self.accept_result if accepted else 1
+            self.push(lc.CMD_LOGIN_RESULT, [TTLVField(3, TYPE_NUMBER, result)])
+            if accepted:
+                self._session_iv = CHALLENGE.encode()
+        elif cmd == lc.CMD_WRITE and self.ack_writes:
+            if self.ack_writes is not True:
+                self.ack_writes -= 1
+            later(self.ack_delay, self.push, lc.CMD_WRITE_ACK, [TTLVField(1, TYPE_NUMBER, 0)])
+
+
+class FakeTimer:
+    def __init__(self, interval, function, args=()):
+        self.interval = interval
+        self.function = function
+        self.args = args
+        self.cancelled = False
+        self.daemon = False
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        self.function(*self.args)
 
 
 @pytest.fixture
-def client():
-    return LandbookLocalClient(
-        product_key="p11vkW",
-        device_key="A8DD9FE36D91",
-        auth_key_b64=AUTH_KEY_B64,
-        ip="192.168.1.50",
-        port=6607,
-    )
+def device(monkeypatch):
+    devices = [FakeDevice()]
+
+    def create_connection(_addr, timeout):
+        if devices[-1].closed or devices[-1].received:
+            devices.append(FakeDevice())
+        return devices[-1]
+
+    monkeypatch.setattr(lc.socket, "create_connection", create_connection)
+    dev = devices[0]
+    dev.all = devices
+    return dev
 
 
-def make_discovery_frame(
-    pk="p11vkW", dk="A8DD9FE36D91", ip="192.168.1.50", port=6607, version=1
-) -> DecodedFrame:
-    fields = [
-        TTLVField(3, TYPE_BYTES, pk.encode()),
-        TTLVField(4, TYPE_BYTES, dk.encode()),
-        TTLVField(5, TYPE_BYTES, ip.encode()),
-        TTLVField(6, TYPE_NUMBER, port),
-        TTLVField(7, TYPE_NUMBER, version),
-    ]
-    return DecodedFrame(packet_id=1, cmd=28721, payload=encode_fields(fields))
+@pytest.fixture
+def timers(monkeypatch):
+    created: list[FakeTimer] = []
+
+    def new_timer(interval, function, args=()):
+        timer = FakeTimer(interval, function, args)
+        created.append(timer)
+        return timer
+
+    monkeypatch.setattr(lc.threading, "Timer", new_timer)
+    return created
 
 
-class TestParseDiscoveryReply:
-    def test_valid_reply(self):
-        device = _parse_discovery_reply(make_discovery_frame())
-        assert device is not None
-        assert device.product_key == "p11vkW"
-        assert device.device_key == "A8DD9FE36D91"
-        assert device.ip == "192.168.1.50"
-        assert device.port == 6607
-        assert device.version == 1
+@pytest.fixture
+def client(device, timers):
+    c = LandbookLocalClient("p11vkW", "A8DD9FE36D91", AUTH_KEY_B64, "192.168.1.50", 6607)
+    yield c
+    c.disconnect()
 
-    def test_wrong_cmd_ignored(self):
-        frame = DecodedFrame(packet_id=1, cmd=1, payload=b"")
-        assert _parse_discovery_reply(frame) is None
 
-    def test_missing_required_field_ignored(self):
-        # no port (id=6) -> incomplete, should be rejected
-        fields = [TTLVField(3, TYPE_BYTES, b"pk"), TTLVField(4, TYPE_BYTES, b"dk")]
-        frame = DecodedFrame(packet_id=1, cmd=28721, payload=encode_fields(fields))
-        assert _parse_discovery_reply(frame) is None
+@pytest.fixture
+def connected(client):
+    client.connect(timeout=2.0)
+    return client
 
-    def test_malformed_payload_ignored(self):
-        frame = DecodedFrame(packet_id=1, cmd=28721, payload=b"\xff\xff\xff")
-        assert _parse_discovery_reply(frame) is None
+
+class TestDiscovery:
+    class FakeUDP:
+        def __init__(self, replies, send_error=None):
+            self.replies = list(replies)
+            self.send_error = send_error
+            self.sent = []
+            self.closed = False
+
+        def setsockopt(self, *_a):
+            pass
+
+        def bind(self, _addr):
+            pass
+
+        def settimeout(self, _t):
+            pass
+
+        def sendto(self, data, addr):
+            if self.send_error:
+                raise self.send_error
+            self.sent.append((data, addr))
+
+        def recvfrom(self, _n):
+            if self.replies:
+                return self.replies.pop(0), ("192.168.1.50", 6606)
+            time.sleep(0.01)
+            raise TimeoutError
+
+        def close(self):
+            self.closed = True
+
+    @staticmethod
+    def reply(pk="p11vkW", dk="A8DD9FE36D91", ip="192.168.1.50", port=6607, cmd=28721):
+        fields = [
+            TTLVField(3, TYPE_BYTES, pk.encode()),
+            TTLVField(4, TYPE_BYTES, dk.encode()),
+            TTLVField(5, TYPE_BYTES, ip.encode()),
+            TTLVField(6, TYPE_NUMBER, port),
+            TTLVField(7, TYPE_NUMBER, 1),
+        ]
+        return encode_frame(cmd, encode_fields(fields), packet_id=1)
+
+    def run(self, monkeypatch, udp):
+        monkeypatch.setattr(lc.socket, "socket", lambda *_a: udp)
+        return discover_devices(timeout=0.1)
+
+    def test_collects_and_dedups_replies(self, monkeypatch):
+        udp = self.FakeUDP([self.reply(), self.reply(), self.reply(dk="OTHER")])
+        devices = self.run(monkeypatch, udp)
+        assert {(d.product_key, d.device_key, d.ip, d.port, d.version) for d in devices} == {
+            ("p11vkW", "A8DD9FE36D91", "192.168.1.50", 6607, 1),
+            ("p11vkW", "OTHER", "192.168.1.50", 6607, 1),
+        }
+        assert udp.sent[0][1] == ("255.255.255.255", 6606)
+        assert udp.closed
+
+    def test_ignores_wrong_cmd_incomplete_and_malformed_replies(self, monkeypatch):
+        incomplete = encode_frame(
+            28721, encode_fields([TTLVField(3, TYPE_BYTES, b"pk")]), packet_id=1
+        )
+        malformed = encode_frame(28721, b"\xff\xff\xff", packet_id=1)
+        udp = self.FakeUDP([self.reply(cmd=1), incomplete, malformed, b"\xaa\xaa\x00\x00\x00"])
+        assert self.run(monkeypatch, udp) == []
+
+    def test_keeps_listening_when_broadcast_fails(self, monkeypatch):
+        udp = self.FakeUDP([self.reply()], send_error=OSError("no broadcast interface"))
+        assert len(self.run(monkeypatch, udp)) == 1
+
+
+class TestLogin:
+    def test_handshake_then_encrypted_heartbeat_start(self, device, connected):
+        assert connected.is_connected
+        assert device.sent(lc.CMD_REQUEST_RANDOM) == [[]]
+        assert device.sent(lc.CMD_HEARTBEAT_START) == [
+            [TTLVField(1, TYPE_NUMBER, 30), TTLVField(2, TYPE_NUMBER, 1)]
+        ]
+
+    def test_result_2_also_counts_as_accepted(self, device, client):
+        device.accept_result = 2
+        client.connect(timeout=2.0)
+        assert client.is_connected
+
+    def test_wrong_auth_key_is_rejected(self, device, client):
+        device.auth_key = b"fedcba9876543210"
+        with pytest.raises(ConnectionError, match="rejected"):
+            client.connect(timeout=2.0)
+        assert not client.is_connected
+        assert device.closed
+
+    def test_no_answer_times_out(self, device, client):
+        device.answer_challenge = False
+        with pytest.raises(ConnectionError, match="timed out"):
+            client.connect(timeout=0.1)
+        assert not client.is_connected
+        assert device.closed
+
+    def test_reconnecting_from_on_disconnect(self, device, connected):
+        reconnected = threading.Event()
+
+        def on_disconnect():
+            connected.connect(timeout=2.0)
+            reconnected.set()
+
+        connected.on_disconnect = on_disconnect
+        device.hang_up()
+        assert reconnected.wait(3.0)
+        assert connected.is_connected
+        assert device.all[-1] is not device
+
+    def test_reconnecting_the_same_instance_logs_in_fresh(self, device, connected):
+        on_disconnect = []
+        connected.on_disconnect = lambda: on_disconnect.append(True)
+        connected.connect(timeout=2.0)
+        assert connected.is_connected
+        assert device.closed
+        assert device.all[-1] is not device
+        assert on_disconnect == []
+
+    def test_reconnecting_clears_properties_from_the_previous_session(self, device, connected):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        connected.connect(timeout=2.0)
+        assert connected.properties == {}
+
+
+class TestReadWrite:
+    def test_write_sends_encrypted_fields(self, device, connected):
+        connected.write([TTLVField(1, TYPE_BOOL_TRUE, None)])
+        assert device.sent(lc.CMD_WRITE) == [[TTLVField(1, TYPE_BOOL_TRUE, True)]]
+
+    def test_write_and_wait_true_on_ack(self, connected):
+        assert connected.write_and_wait([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=2.0)
+
+    def test_write_and_wait_false_without_ack(self, device, connected):
+        device.ack_writes = False
+        assert not connected.write_and_wait([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=0.1)
+
+    def test_write_and_wait_returns_early_when_connection_drops(self, device, connected):
+        device.ack_writes = False
+        later(0.05, device.hang_up)
+        start = time.monotonic()
+        assert not connected.write_and_wait([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=5.0)
+        assert time.monotonic() - start < 2.0
+
+    def test_concurrent_write_and_wait_each_see_an_ack(self, connected):
+        results = []
+        threads = [
+            threading.Thread(
+                target=lambda: results.append(
+                    connected.write_and_wait([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=2.0)
+                )
+            )
+            for _ in range(4)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results == [True] * 4
+
+    def test_concurrent_write_and_wait_attributes_one_ack_to_one_caller(self, device, connected):
+        device.ack_writes = 1
+        device.ack_delay = 0.1  # both callers are waiting by the time the one ack lands
+        start = threading.Barrier(2)
+        results = []
+
+        def write():
+            start.wait()
+            results.append(
+                connected.write_and_wait([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=0.5)
+            )
+
+        threads = [threading.Thread(target=write) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(results) == [False, True]
+
+    def test_write_after_disconnect_raises_connection_error(self, connected):
+        connected.disconnect()
+        with pytest.raises(ConnectionError):
+            connected.write([TTLVField(1, TYPE_BOOL_TRUE, None)])
+
+    def test_read_sends_untyped_id_list(self, device, connected):
+        connected.read([1, 300])
+        assert device.sent(lc.CMD_READ) == [b"\x00\x01\x01\x2c"]
 
 
 class TestPropertyCache:
-    def test_on_data_updates_properties_and_fires_callback(self, client):
-        received = []
-        client.on_update = lambda fields: received.append(fields)
+    def test_status_push_updates_properties_and_fires_on_update(self, device, connected):
+        updates = []
+        connected.on_update = updates.append
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_BOOL_TRUE, None)])
+        assert wait_until(lambda: updates)
+        assert connected.properties == {1: True}
+        assert updates == [[TTLVField(1, TYPE_BOOL_TRUE, True)]]
 
-        payload = encode_fields([TTLVField(1, TYPE_BOOL_TRUE, True)])
-        client._on_data(payload)
-
-        assert client.properties == {1: True}
-        assert received == [[TTLVField(1, TYPE_BOOL_TRUE, True)]]
-
-    def test_write_ack_does_not_touch_property_cache(self, client):
-        client.properties[1] = True  # simulate a known-good prior state
+    def test_write_ack_does_not_touch_property_cache(self, device, connected):
         acks = []
-        client.on_write_ack = lambda fields: acks.append(fields)
-
-        # A write ack whose payload happens to reuse id=1 with an unrelated
-        # value must not clobber the real property cache for id=1.
-        ack_payload = encode_fields([TTLVField(1, TYPE_NUMBER, 0)])
-        client._on_write_ack(ack_payload)
-
-        assert client.properties == {1: True}
+        connected.on_write_ack = acks.append
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_BOOL_TRUE, None)])
+        # An ack reusing id=1 with an unrelated value must not clobber id=1.
+        device.push(lc.CMD_WRITE_ACK, [TTLVField(1, TYPE_NUMBER, 0)])
+        assert wait_until(lambda: acks)
+        assert connected.properties == {1: True}
         assert acks == [[TTLVField(1, TYPE_NUMBER, 0)]]
 
-    def test_malformed_data_frame_logged_not_raised(self, client, caplog):
-        client._on_data(b"\xff\xff\xff")  # not valid TTLV
-        assert client.properties == {}
+    @pytest.mark.parametrize(
+        ("payload", "encrypt"),
+        [
+            (b"\x00\x0b", True),  # truncated TTLV: bytes field with no length prefix
+            (b"not a valid ciphertext block!!!", False),
+        ],
+    )
+    def test_bad_frame_is_dropped_and_connection_survives(
+        self, device, connected, payload, encrypt
+    ):
+        updates = []
+        connected.on_update = updates.append
+        device.push_raw(lc.CMD_STATUS_PUSH_OBSERVED, payload, encrypt=encrypt)
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(2, TYPE_NUMBER, 5)])
+        assert wait_until(lambda: updates)
+        assert connected.properties == {2: 5}
+        assert connected.is_connected
 
-    def test_decrypt_failure_logged_not_raised(self, client):
-        client._cipher_key = b"0123456789abcdef"
-        client._cipher_iv = b"0123456789abcdef"
-        client._on_data(b"not a valid ciphertext block!!!!")
-        assert client.properties == {}
+    def test_callback_exception_does_not_kill_the_connection(self, device, connected):
+        def boom(_fields):
+            raise ValueError("boom")
+
+        connected.on_update = boom
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(2, TYPE_NUMBER, 2)])
+        assert wait_until(lambda: 2 in connected.properties)
+        assert connected.is_connected
+
+    def test_unknown_cmd_is_ignored(self, device, connected):
+        device.push(9999, [TTLVField(1, TYPE_NUMBER, 1)])
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(2, TYPE_NUMBER, 2)])
+        assert wait_until(lambda: 2 in connected.properties)
+        assert connected.properties == {2: 2}
+
+
+class TestWriteAndConfirm:
+    @pytest.mark.parametrize(
+        ("reply", "confirmed"),
+        [
+            # Bools live in the TTLV type, so a None-valued write must match.
+            ([TTLVField(1, TYPE_BOOL_TRUE, None)], True),
+            ([TTLVField(1, TYPE_NUMBER, 0)], False),  # different value
+            ([TTLVField(2, TYPE_NUMBER, 5)], False),  # unrelated property
+            (None, False),  # write ack only, no fresh report
+        ],
+    )
+    def test_needs_a_fresh_matching_report(self, device, connected, reply, confirmed):
+        device.read_reply = reply
+        written = [TTLVField(1, TYPE_BOOL_TRUE, None)]
+        assert connected.write_and_confirm(written, timeout=0.2) is confirmed
+        assert device.sent(lc.CMD_WRITE) == [[TTLVField(1, TYPE_BOOL_TRUE, True)]]
+        assert len(device.sent(lc.CMD_READ)) == 1
+
+    def test_cached_matching_value_does_not_confirm(self, device, connected):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_BOOL_TRUE, None)])
+        assert wait_until(lambda: 1 in connected.properties)
+        assert not connected.write_and_confirm([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=0.1)
+
+    @pytest.mark.parametrize(
+        ("reply", "confirmed"),
+        [
+            ([TTLVField(1, TYPE_NUMBER, 3), TTLVField(2, TYPE_BOOL_TRUE, None)], True),
+            ([TTLVField(1, TYPE_NUMBER, 3), TTLVField(2, TYPE_NUMBER, 0)], False),
+            ([TTLVField(1, TYPE_NUMBER, 3)], False),
+        ],
+    )
+    def test_every_written_field_must_be_confirmed(self, device, connected, reply, confirmed):
+        device.read_reply = reply
+        written = [TTLVField(1, TYPE_NUMBER, 3), TTLVField(2, TYPE_BOOL_TRUE, None)]
+        assert connected.write_and_confirm(written, timeout=0.2) is confirmed
+
+    def test_empty_write_is_unconfirmed_and_sends_nothing(self, device, connected):
+        assert not connected.write_and_confirm([])
+        assert device.sent(lc.CMD_WRITE) == []
+
+    def test_returns_early_when_connection_drops(self, device, connected):
+        later(0.05, device.hang_up)
+        start = time.monotonic()
+        assert not connected.write_and_confirm([TTLVField(1, TYPE_NUMBER, 3)], timeout=5.0)
+        assert time.monotonic() - start < 2.0
 
 
 class TestReadAndWait:
-    def test_returns_immediately_when_already_cached(self, client):
-        client.properties[1] = True
-        client.properties[2] = 5
-        client._send = lambda *a, **kw: None  # avoid touching a real socket
-        result = client.read_and_wait([1, 2], timeout=1.0)
-        assert result == {1: True, 2: 5}
+    def test_returns_cached_values(self, device, connected):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        assert connected.read_and_wait([1], timeout=0.1) == {1: 1}
 
-    def test_waits_for_a_background_update(self, client):
-        client._send = lambda *a, **kw: None
+    def test_waits_for_a_push(self, device, connected):
+        later(0.05, device.push, lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(9, TYPE_NUMBER, 42)])
+        assert connected.read_and_wait([9], timeout=2.0) == {9: 42}
 
-        def deliver_later():
-            time.sleep(0.05)
-            client._on_data(encode_fields([TTLVField(9, TYPE_NUMBER, 42)]))
-
-        threading.Thread(target=deliver_later, daemon=True).start()
-        result = client.read_and_wait([9], timeout=2.0)
-        assert result == {9: 42}
-
-    def test_partial_result_on_timeout(self, client):
-        client._send = lambda *a, **kw: None
-        client.properties[1] = True  # only one of the two requested ids ever arrives
-        result = client.read_and_wait([1, 2], timeout=0.1)
-        assert result == {1: True}
-
-    def test_empty_result_on_timeout_when_nothing_arrives(self, client):
-        client._send = lambda *a, **kw: None
-        result = client.read_and_wait([99], timeout=0.1)
-        assert result == {}
+    def test_partial_result_on_timeout(self, device, connected):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        assert connected.read_and_wait([1, 2], timeout=0.1) == {1: 1}
 
 
-class TestStatusPushCmdRecognized:
-    def test_status_push_observed_constant_matches_real_device_finding(self):
-        # cmd=20, observed as a continuous unsolicited push on a real
-        # GE OmniBreeze fan (p11vkW) — see local_client's module docstring.
-        assert CMD_STATUS_PUSH_OBSERVED == 20
+class TestDisconnect:
+    def test_remote_hang_up_fires_on_disconnect(self, device, connected):
+        fired = threading.Event()
+        connected.on_disconnect = fired.set
+        device.hang_up()
+        assert fired.wait(2.0)
+        assert not connected.is_connected
 
+    def test_socket_error_fires_on_disconnect(self, device, connected):
+        fired = threading.Event()
+        connected.on_disconnect = fired.set
+        device.close()
+        assert fired.wait(2.0)
+        assert not connected.is_connected
 
-class TestDisconnectDetection:
-    def test_on_disconnect_fires_on_broken_socket(self, client):
+    def test_missing_on_disconnect_callback_is_fine(self, device, connected):
+        device.hang_up()
+        assert wait_until(lambda: not connected.is_connected)
+
+    def test_caller_disconnect_does_not_fire_on_disconnect(self, device, connected, timers):
         fired = []
-        client.on_disconnect = lambda: fired.append(True)
-        mock_sock = MagicMock()
-        mock_sock.recv.side_effect = OSError("connection reset")
-        client._sock = mock_sock
-
-        client._recv_loop()
-
-        assert fired == [True]
-
-    def test_on_disconnect_fires_when_remote_closes_cleanly(self, client):
-        fired = []
-        client.on_disconnect = lambda: fired.append(True)
-        mock_sock = MagicMock()
-        mock_sock.recv.return_value = b""  # empty read = remote closed
-        client._sock = mock_sock
-
-        client._recv_loop()
-
-        assert fired == [True]
-
-    def test_on_disconnect_not_fired_for_caller_initiated_disconnect(self, client):
-        """disconnect() sets _shutting_down before touching the socket —
-        _recv_loop must recognize that as a clean, expected exit and not
-        report it as a surprise disconnection."""
-        fired = []
-        client.on_disconnect = lambda: fired.append(True)
-        client._shutting_down = True
-        mock_sock = MagicMock()
-        mock_sock.recv.side_effect = OSError("bad file descriptor")
-        client._sock = mock_sock
-
-        client._recv_loop()
-
+        connected.on_disconnect = lambda: fired.append(True)
+        connected.disconnect()
+        time.sleep(0.1)
         assert fired == []
-
-    def test_missing_on_disconnect_callback_does_not_raise(self, client):
-        mock_sock = MagicMock()
-        mock_sock.recv.side_effect = OSError("connection reset")
-        client._sock = mock_sock
-
-        client._recv_loop()  # must not raise with on_disconnect left unset
+        assert not connected.is_connected
+        assert device.closed
+        assert all(t.cancelled for t in timers)
 
 
-class TestIsConnected:
-    def test_false_before_connecting(self, client):
-        assert client.is_connected is False
+class TestHeartbeat:
+    def test_sends_ping_and_reschedules(self, device, connected, timers):
+        [timer] = timers
+        assert timer.interval == lc.HEARTBEAT_INTERVAL
+        timer.fire()
+        assert device.sent(lc.CMD_HEARTBEAT_PING) == [[]]
+        assert len(timers) == 2
 
-    def test_true_once_socket_open_and_logged_in(self, client):
-        client._sock = MagicMock()
-        client._logged_in.set()
-        assert client.is_connected is True
+    @pytest.mark.parametrize("stale", ["HEARTBEAT_PONG_TIMEOUT", "DATA_STALL_TIMEOUT"])
+    def test_stale_pong_or_data_tears_down(self, device, connected, timers, monkeypatch, stale):
+        monkeypatch.setattr(lc, stale, -1.0)
+        fired = threading.Event()
+        connected.on_disconnect = fired.set
+        timers[0].fire()
+        assert fired.wait(2.0)
+        assert not connected.is_connected
+        assert device.sent(lc.CMD_HEARTBEAT_PING) == []
 
-    def test_false_while_logged_in_flag_not_yet_set(self, client):
-        client._sock = MagicMock()
-        assert client.is_connected is False
+    def test_quiet_session_is_probed_before_teardown(self, device, connected, timers, monkeypatch):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        monkeypatch.setattr(lc, "DATA_STALL_TIMEOUT", -1.0)
+        timers[0].fire()
+        assert device.sent(lc.CMD_READ) == [lc.encode_id_list([1])]
+        assert device.sent(lc.CMD_HEARTBEAT_PING) == [[]]
+        assert connected.is_connected
 
-    def test_false_after_disconnect(self, client):
-        client._sock = MagicMock()
-        client._logged_in.set()
-        client.disconnect()
-        assert client.is_connected is False
-
-
-class TestHeartbeatPongTimeout:
-    def test_heartbeat_reply_updates_last_pong(self, client):
-        client._last_pong = 100.0
-        frame = DecodedFrame(packet_id=1, cmd=CMD_HEARTBEAT_REPLY, payload=b"")
-        with patch("landbook_api.local_client.time") as mock_time:
-            mock_time.monotonic.return_value = 200.0
-            client._handle_frame(frame)
-        assert client._last_pong == 200.0
-
-    def test_heartbeat_constants(self):
-        assert CMD_HEARTBEAT_START == 28729
-        assert CMD_HEARTBEAT_PING == 28727
-        assert CMD_HEARTBEAT_REPLY == 28728
-
-    def test_pong_timeout_constant(self):
-        assert HEARTBEAT_PONG_TIMEOUT == 30.0
-
-    def test_send_heartbeat_sends_ping_cmd_with_empty_payload(self, client):
-        client._sock = MagicMock()
-        client._cipher_key = b"0123456789abcdef"
-        client._cipher_iv = b"0123456789abcdef"
-        sent = []
-        client._send = lambda cmd, payload: sent.append((cmd, payload))
-        with patch("landbook_api.local_client.time") as mock_time:
-            mock_time.monotonic.return_value = 100.0
-            client._last_pong = 90.0
-            client._send_heartbeat()
-        assert sent == [(CMD_HEARTBEAT_PING, b"")]
-        assert client._heartbeat_timer is not None
-        client._heartbeat_timer.cancel()
-
-    def test_send_heartbeat_tears_down_on_stale_pong(self, client):
-        client._sock = MagicMock()
-        client._logged_in.set()
-        client._last_pong = 50.0
-        force_called = []
-        client._force_disconnect = lambda: force_called.append(True)
-        with patch("landbook_api.local_client.time") as mock_time:
-            mock_time.monotonic.return_value = 100.0
-            client._send_heartbeat()
-        assert force_called == [True]
-
-    def test_force_disconnect_closes_socket_and_cancels_timer(self, client):
-        mock_sock = MagicMock()
-        client._sock = mock_sock
-        mock_timer = MagicMock()
-        client._heartbeat_timer = mock_timer
-        client._force_disconnect()
-        mock_timer.cancel.assert_called_once()
-        mock_sock.close.assert_called_once()
-        assert client._heartbeat_timer is None
-
-    def test_force_disconnect_triggers_on_disconnect_via_recv_loop(self, client):
-        fired = []
-        client.on_disconnect = lambda: fired.append(True)
-        mock_sock = MagicMock()
-        mock_sock.recv.side_effect = OSError("bad file descriptor")
-        client._sock = mock_sock
-        client._recv_loop()
-        assert fired == [True]
-
-    def test_last_pong_initialized_on_login(self, client):
-        assert client._last_pong == 0.0
-        assert client.last_property_update == 0.0
-        client._sock = MagicMock()
-        sent = []
-        client._send = lambda cmd, payload: sent.append((cmd, payload))
-        client._random_challenge = "abcdefghijklmnop"
-        with patch("landbook_api.local_client.time") as mock_time:
-            mock_time.monotonic.return_value = 999.0
-            login_payload = encode_fields([TTLVField(3, TYPE_NUMBER, 0)])
-            client._on_login_result(login_payload)
-        assert client._last_pong == 999.0
-        assert client.last_property_update == 999.0
-        assert sent[0][0] == CMD_HEARTBEAT_START
-        assert sent[0][1] != b""
-        if client._heartbeat_timer:
-            client._heartbeat_timer.cancel()
-
-
-class TestDataStallTimeout:
-    def test_quiet_session_probes_before_disconnect_and_fresh_data_recovers(self, client):
-        client._sock = MagicMock()
-        client.properties[1] = True
-        client._last_pong = 99.0
-        client.last_property_update = 5.0
-        with (
-            patch("landbook_api.local_client.time.monotonic", return_value=100.0),
-            patch("landbook_api.local_client.threading.Timer"),
-        ):
-            client._send_heartbeat()
-            frames = FrameDecoder().feed(
-                b"".join(c.args[0] for c in client._sock.sendall.call_args_list)
-            )
-            assert [f.cmd for f in frames] == [CMD_READ, CMD_HEARTBEAT_PING]
-            client._sock.close.assert_not_called()
-            # A new property frame, even with an unchanged value, is fresh evidence.
-            client._on_data(encode_fields([TTLVField(1, TYPE_BOOL_TRUE, True)]))
-            assert client._data_probe_started is None
-            client._send_heartbeat()
-            client._sock.close.assert_not_called()
+    def test_fresh_properties_answer_the_probe(self, device, connected, timers, monkeypatch):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        monkeypatch.setattr(lc, "DATA_STALL_TIMEOUT", -1.0)
+        monkeypatch.setattr(lc, "DATA_PROBE_TIMEOUT", 0.0)
+        device.read_reply = [TTLVField(1, TYPE_NUMBER, 1)]  # unchanged value still counts
+        updates = []
+        connected.on_update = updates.append
+        timers[0].fire()
+        assert wait_until(lambda: updates)
+        timers[1].fire()
+        # Still stalled, so it probes again rather than tearing down.
+        assert len(device.sent(lc.CMD_READ)) == 2
+        assert connected.is_connected
 
     @pytest.mark.parametrize("reply", ["pong", "ack", "empty", "malformed"])
-    def test_probe_requires_properties_not_transport_replies(self, client, reply):
-        sock = MagicMock()
-        client._sock = sock
-        client.properties[1] = True
-        client._last_pong = 99.0
-        client.last_property_update = 5.0
-        with (
-            patch("landbook_api.local_client.time.monotonic", return_value=100.0),
-            patch("landbook_api.local_client.threading.Timer"),
-        ):
-            client._send_heartbeat()
-            if reply == "pong":
-                client._handle_frame(DecodedFrame(1, CMD_HEARTBEAT_REPLY, b""))
-            elif reply == "ack":
-                client._on_write_ack(encode_fields([TTLVField(1, TYPE_NUMBER, 0)]))
-            elif reply == "empty":
-                client._on_data(encode_fields([]))
-            else:
-                client._on_data(b"\xff\xff\xff")
-            assert client.last_property_update == 5.0
-        with patch(
-            "landbook_api.local_client.time.monotonic", return_value=100.0 + DATA_PROBE_TIMEOUT
-        ):
-            client._send_heartbeat()
-        sock.close.assert_called_once()
+    def test_only_properties_answer_the_probe(self, device, connected, timers, monkeypatch, reply):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        monkeypatch.setattr(lc, "DATA_STALL_TIMEOUT", -1.0)
+        monkeypatch.setattr(lc, "DATA_PROBE_TIMEOUT", 0.0)
+        fired = threading.Event()
+        connected.on_disconnect = fired.set
+        timers[0].fire()
+        if reply == "pong":
+            device.push_raw(lc.CMD_HEARTBEAT_REPLY, b"")
+        elif reply == "ack":
+            device.push(lc.CMD_WRITE_ACK, [TTLVField(1, TYPE_NUMBER, 0)])
+        elif reply == "empty":
+            device.push(lc.CMD_STATUS_PUSH_OBSERVED, [])
+        else:
+            device.push_raw(lc.CMD_STATUS_PUSH_OBSERVED, b"\x00\x0b")
+        time.sleep(0.1)
+        timers[1].fire()
+        assert fired.wait(2.0)
+        assert not connected.is_connected
 
-    def test_probe_send_error_disconnects(self, client):
-        sock = MagicMock()
-        sock.sendall.side_effect = OSError("broken pipe")
-        client._sock = sock
-        client.properties[1] = True
-        client._last_pong = 99.0
-        client.last_property_update = 5.0
-        with patch("landbook_api.local_client.time.monotonic", return_value=100.0):
-            client._send_heartbeat()
-        sock.close.assert_called_once()
+    def test_probe_send_failure_tears_down(self, device, connected, timers, monkeypatch):
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        monkeypatch.setattr(lc, "DATA_STALL_TIMEOUT", -1.0)
+        device.fail_reads = True
+        fired = threading.Event()
+        connected.on_disconnect = fired.set
+        timers[0].fire()
+        assert fired.wait(2.0)
+        assert device.sent(lc.CMD_HEARTBEAT_PING) == []
 
-    def test_data_stall_constant(self):
-        assert DATA_STALL_TIMEOUT == 90.0
-
-    def test_on_data_updates_last_property_update(self, client):
-        client.last_property_update = 100.0
-        payload = encode_fields([TTLVField(1, TYPE_BOOL_TRUE, True)])
-        with patch("landbook_api.local_client.time") as mock_time:
-            mock_time.monotonic.return_value = 200.0
-            client._on_data(payload)
-        assert client.last_property_update == 200.0
-
-    def test_send_heartbeat_tears_down_on_data_stall(self, client):
-        client._sock = MagicMock()
-        client._last_pong = 90.0
-        client.last_property_update = 5.0
-        force_called = []
-        client._force_disconnect = lambda: force_called.append(True)
-        with patch("landbook_api.local_client.time") as mock_time:
-            mock_time.monotonic.return_value = 100.0
-            client._send_heartbeat()
-        assert force_called == [True]
-
-    def test_send_heartbeat_ok_when_data_recent(self, client):
-        client._sock = MagicMock()
-        sent = []
-        client._send = lambda cmd, payload: sent.append(cmd)
-        with patch("landbook_api.local_client.time") as mock_time:
-            mock_time.monotonic.return_value = 100.0
-            client._last_pong = 90.0
-            client.last_property_update = 90.0
-            client._send_heartbeat()
-        assert len(sent) == 1
-        assert client._heartbeat_timer is not None
-        client._heartbeat_timer.cancel()
-
-    def test_pong_timeout_checked_before_data_stall(self, client):
-        """If both pong and data are stale, pong timeout fires first
-        (it's checked first in _send_heartbeat)."""
-        client._sock = MagicMock()
-        client._last_pong = 5.0
-        client.last_property_update = 5.0
-        force_called = []
-        client._force_disconnect = lambda: force_called.append(True)
-        with patch("landbook_api.local_client.time") as mock_time:
-            mock_time.monotonic.return_value = 100.0
-            client._send_heartbeat()
-        assert force_called == [True]
-
-    def test_data_stall_with_fresh_pong(self, client):
-        """The key scenario: heartbeats answering fine but no property
-        pushes — data stall should fire even though pong is fresh."""
-        client._sock = MagicMock()
-        client._last_pong = 99.0
-        client.last_property_update = 5.0
-        force_called = []
-        client._force_disconnect = lambda: force_called.append(True)
-        with patch("landbook_api.local_client.time") as mock_time:
-            mock_time.monotonic.return_value = 100.0
-            client._send_heartbeat()
-        assert force_called == [True]
-
-
-class TestWriteAndWait:
-    @pytest.mark.parametrize("reply", ["match", "wrong", "ack", "unrelated"])
-    def test_write_confirmation_requires_new_matching_properties(self, client, reply):
-        client._sock = MagicMock()
-        client._on_data(encode_fields([TTLVField(1, TYPE_BOOL_TRUE, True)]))
-
-        def receive_after_write(wire):
-            frame = FrameDecoder().feed(wire)[0]
-            if frame.cmd != 19:
-                return
-            if reply == "match":
-                client._on_data(encode_fields([TTLVField(1, TYPE_BOOL_TRUE, None)]))
-            elif reply == "wrong":
-                client._on_data(encode_fields([TTLVField(1, TYPE_NUMBER, 0)]))
-            elif reply == "ack":
-                client._on_write_ack(encode_fields([TTLVField(1, TYPE_NUMBER, 0)]))
-            else:
-                client._on_data(encode_fields([TTLVField(2, TYPE_NUMBER, 5)]))
-
-        client._sock.sendall.side_effect = receive_after_write
-        assert client.write_and_confirm([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=0.01) is (
-            reply == "match"
-        )
-
-    def test_cached_matching_value_does_not_confirm_write(self, client):
-        client._sock = MagicMock()
-        client._on_data(encode_fields([TTLVField(1, TYPE_BOOL_TRUE, True)]))
-        assert not client.write_and_confirm([TTLVField(1, TYPE_BOOL_TRUE, None)], timeout=0.01)
-
-    def test_returns_true_when_ack_arrives(self, client):
-        client._sock = MagicMock()
-        client._cipher_key = b"0123456789abcdef"
-        client._cipher_iv = b"0123456789abcdef"
-
-        def _send_with_ack(cmd, payload):
-            if cmd == 19:  # CMD_WRITE
-                ack_payload = encode_fields([TTLVField(1, TYPE_NUMBER, 0)])
-                threading.Timer(
-                    0.01, client._on_write_ack, args=[client._encrypt(ack_payload)]
-                ).start()
-
-        client._send = _send_with_ack
-        fields = [TTLVField(1, TYPE_BOOL_TRUE, True)]
-        assert client.write_and_wait(fields, timeout=1.0) is True
-
-    def test_returns_false_on_timeout(self, client):
-        client._sock = MagicMock()
-        client._cipher_key = b"0123456789abcdef"
-        client._cipher_iv = b"0123456789abcdef"
-        client._send = lambda cmd, payload: None
-
-        fields = [TTLVField(1, TYPE_BOOL_TRUE, True)]
-        assert client.write_and_wait(fields, timeout=0.05) is False
-
-    def test_clears_event_after_completion(self, client):
-        client._sock = MagicMock()
-        client._cipher_key = b"0123456789abcdef"
-        client._cipher_iv = b"0123456789abcdef"
-        client._send = lambda cmd, payload: None
-
-        fields = [TTLVField(1, TYPE_BOOL_TRUE, True)]
-        client.write_and_wait(fields, timeout=0.05)
-        assert client._write_ack_event is None
-
-    def test_on_write_ack_callback_still_fires(self, client):
-        client._sock = MagicMock()
-        client._cipher_key = b"0123456789abcdef"
-        client._cipher_iv = b"0123456789abcdef"
-
-        acks = []
-        client.on_write_ack = lambda fields: acks.append(fields)
-
-        def _send_with_ack(cmd, payload):
-            if cmd == 19:
-                ack_payload = encode_fields([TTLVField(1, TYPE_NUMBER, 0)])
-                threading.Timer(
-                    0.01, client._on_write_ack, args=[client._encrypt(ack_payload)]
-                ).start()
-
-        client._send = _send_with_ack
-        fields = [TTLVField(1, TYPE_BOOL_TRUE, True)]
-        client.write_and_wait(fields, timeout=1.0)
-        assert len(acks) == 1
-
-    def test_write_ack_cmd_constant(self):
-        assert CMD_WRITE_ACK == 28726
+    def test_pong_and_data_keep_the_connection_alive(self, device, connected, timers, monkeypatch):
+        monkeypatch.setattr(lc, "HEARTBEAT_PONG_TIMEOUT", 0.5)
+        monkeypatch.setattr(lc, "DATA_STALL_TIMEOUT", 0.5)
+        time.sleep(0.6)
+        device.push_raw(lc.CMD_HEARTBEAT_REPLY, b"")
+        device.push(lc.CMD_STATUS_PUSH_OBSERVED, [TTLVField(1, TYPE_NUMBER, 1)])
+        assert wait_until(lambda: 1 in connected.properties)
+        timers[0].fire()
+        assert connected.is_connected
+        assert device.sent(lc.CMD_HEARTBEAT_PING) == [[]]

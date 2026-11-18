@@ -56,6 +56,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
 from .local_protocol import (
+    TYPE_BYTES,
     TYPE_NUMBER,
     DecodedFrame,
     FrameDecoder,
@@ -91,33 +92,46 @@ CMD_STATUS_PUSH_OBSERVED = 20
 # app names this "CMD_TLS_WRITE_RES" in its logging. Its payload doesn't
 # obviously mirror the written value (a bool write got back a numeric field
 # reading 0), so its exact meaning (success/fail code? something else?) is
-# still unconfirmed — decoded and surfaced via on_update like any other
-# data for now.
+# still unconfirmed — it's surfaced via on_write_ack, not the property cache.
 CMD_WRITE_ACK = 28726
 CMD_HEARTBEAT_PING = 28727
 CMD_HEARTBEAT_START = 28729
 CMD_HEARTBEAT_REPLY = 28728
 
 LOGIN_TIMEOUT = 10.0
-# The app sends CMD_HEARTBEAT_START with a 30s interval request, then pings
-# every 10s. We ping at 15s — close enough for the 30s pong timeout while
-# leaving margin for timer jitter.
+# The app sends CMD_HEARTBEAT_START requesting a 30s interval (field 1) with
+# field 2 = 1, then pings every 10s. We ping at 15s — close enough for the 30s
+# pong timeout while leaving margin for timer jitter.
+_HEARTBEAT_START_FIELDS = [TTLVField(1, TYPE_NUMBER, 30), TTLVField(2, TYPE_NUMBER, 1)]
 HEARTBEAT_INTERVAL = 15.0
 # If no heartbeat reply arrives within this window, treat the connection as
 # dead and fire on_disconnect. Matches the Landbook app's 30s pong timeout
 # (decompiled from l94.java / mq0.java in APK v3.7.5).
 HEARTBEAT_PONG_TIMEOUT = 30.0
-# If no property data frame (CMD_STATUS_PUSH, CMD_STATUS_PUSH_OBSERVED,
-# CMD_READ_WRITE_RESP) arrives within this window while connected, treat
-# the session as wedged and fire on_disconnect. Covers the "silent but
-# attached" failure mode where heartbeat replies keep flowing but the
-# device stops its spontaneous property-push cycle.
+# If no property data frame arrives within this window while connected,
+# treat the session as wedged and fire on_disconnect. Covers the "silent but
+# attached" failure mode where heartbeat replies keep flowing but the device
+# stops its spontaneous property-push cycle.
 DATA_STALL_TIMEOUT = 90.0
-# Allow one heartbeat interval for an explicit status probe to produce data.
+# A quiet device can still be healthy: on a p11vkW, a status read after 92s
+# of property silence got fresh properties back in 0.13s on the same
+# connection. So a stall first sends one read, and tears down only if no
+# property frame answers within one heartbeat interval.
 DATA_PROBE_TIMEOUT = 15.0
 
 _PACKET_ID_START = 1000
 _PACKET_ID_WRAP = 65535
+
+# TTLV field ids inside the control messages above.
+_DISCOVERY_FIELD_PK = 3
+_DISCOVERY_FIELD_DK = 4
+_DISCOVERY_FIELD_IP = 5
+_DISCOVERY_FIELD_PORT = 6
+_DISCOVERY_FIELD_VERSION = 7
+_RANDOM_FIELD_CHALLENGE = 1
+_LOGIN_FIELD_SIGN = 2
+_LOGIN_RESULT_FIELD = 3
+_LOGIN_RESULT_ACCEPTED = (0, 2)
 
 
 @dataclass
@@ -133,9 +147,9 @@ def discover_devices(timeout: float = 5.0) -> list[DiscoveredDevice]:
     """Broadcast on the local network and collect device replies.
 
     Binds UDP port 6606 for both sending and receiving, like the app does —
-    if the Landbook app is running on the same machine (it won't be, in
-    practice, since this targets Home Assistant, but e.g. a phone emulator
-    on the same host would collide), only one of you can hold that port.
+    only one process per host can hold that port, so this collides with
+    anything else on the same machine doing Landbook discovery (e.g. a phone
+    emulator running the app).
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -157,10 +171,9 @@ def discover_devices(timeout: float = 5.0) -> list[DiscoveredDevice]:
                 try:
                     sock.sendto(probe, ("255.255.255.255", DISCOVERY_PORT))
                 except OSError as exc:
-                    # No active broadcast-capable interface (offline, VPN-only
-                    # routing, a sandboxed environment, ...) — keep listening
-                    # in case a reply arrives anyway, and retry sending on the
-                    # next interval rather than aborting discovery outright.
+                    # No broadcast-capable interface (offline, VPN-only
+                    # routing, a sandbox, ...): keep listening in case a reply
+                    # arrives anyway, and retry on the next interval.
                     if not broadcast_failed:
                         _LOGGER.warning("Landbook local: discovery broadcast failed: %s", exc)
                         broadcast_failed = True
@@ -182,38 +195,27 @@ def _parse_discovery_reply(frame: DecodedFrame) -> DiscoveredDevice | None:
     if frame.cmd != DISCOVERY_REPLY_CMD:
         return None
     try:
-        fields = decode_fields(frame.payload)
+        values = {f.id: f.value for f in decode_fields(frame.payload)}
     except ProtocolError:
         _LOGGER.debug("Landbook local: malformed discovery reply, ignoring")
         return None
 
-    pk = dk = ip = None
-    port = version = 0
-    for f in fields:
-        if f.id == 3:
-            pk = f.value.decode("utf-8")
-        elif f.id == 4:
-            dk = f.value.decode("utf-8")
-        elif f.id == 5:
-            ip = f.value.decode("utf-8")
-        elif f.id == 6:
-            port = int(f.value)
-        elif f.id == 7:
-            version = int(f.value)
-
+    pk = values.get(_DISCOVERY_FIELD_PK, b"").decode("utf-8")
+    dk = values.get(_DISCOVERY_FIELD_DK, b"").decode("utf-8")
+    ip = values.get(_DISCOVERY_FIELD_IP, b"").decode("utf-8")
+    port = int(values.get(_DISCOVERY_FIELD_PORT, 0))
     if not (pk and dk and ip and port):
         return None
+    version = int(values.get(_DISCOVERY_FIELD_VERSION, 0))
     return DiscoveredDevice(product_key=pk, device_key=dk, ip=ip, port=port, version=version)
 
 
 class LandbookLocalClient:
     """A single local-LAN TCP connection to one device.
 
-    One background thread reads and dispatches incoming frames; callers may
-    invoke read()/write() from any thread. Not designed for multiple
-    concurrent LandbookLocalClient instances to share a socket — one
-    instance per device, matching how LandbookMQTTClient is one instance
-    per account.
+    One background thread per connection reads and dispatches incoming
+    frames; callers may invoke read()/write() from any thread. One instance
+    per device, matching how LandbookMQTTClient is one instance per account.
     """
 
     def __init__(
@@ -230,104 +232,110 @@ class LandbookLocalClient:
         self._ip = ip
         self._port = port
 
+        # The live socket. A receive loop whose socket is no longer this one
+        # was superseded by disconnect()/connect() and exits quietly.
         self._sock: socket.socket | None = None
-        self._decoder = FrameDecoder()
-        self._recv_thread: threading.Thread | None = None
-        self._shutting_down = False
-
+        self._send_lock = threading.Lock()
         self._packet_id = _PACKET_ID_START
-        self._wire_lock = threading.RLock()
 
-        self._logged_in = threading.Event()
-        self._login_failed = False
+        self._login_done = threading.Event()
         self._random_challenge: str | None = None
-        self._cipher_key: bytes | None = None
-        self._cipher_iv: bytes | None = None
+        # Set once logged in: from then on every payload is AES/CBC encrypted
+        # with key=auth key, iv=this. None means not logged in.
+        self._session_iv: bytes | None = None
 
         self._heartbeat_timer: threading.Timer | None = None
-        self._last_pong: float = 0.0
-        self.last_property_update: float = 0.0
-        self._data_probe_started: float | None = None
+        self._last_pong = 0.0
+        self.last_property_update = 0.0
 
+        # Guards and signals changes to properties, _write_acks and the
+        # connection itself, for read_and_wait()/write_and_wait().
+        self._state_changed = threading.Condition()
         # Last known value per property (TSL numeric id, not string code),
-        # fed by every status push / read-write response — NOT by
-        # CMD_WRITE_ACK, whose payload doesn't appear to mirror property
-        # state (see _on_write_ack). Populated passively over time by
-        # whatever the device pushes on its own schedule; read_and_wait()
-        # waits on `_property_updated` for ids not yet present.
+        # fed by status pushes and read/write responses as the device sends
+        # them on its own schedule.
         self.properties: dict[int, Any] = {}
-        self._property_updated = threading.Condition()
+        # Bumped per id on every report, so write_and_confirm() can tell a
+        # fresh report from a cached value that already matched.
         self._property_revision: dict[int, int] = {}
-        self._write_confirmation_lock = threading.Lock()
+        # When the pending data-stall probe was sent; None when none is.
+        self._data_probe_started: float | None = None
+        self._write_acks = 0
+        # Acks don't identify the write they answer, so confirmed writes go
+        # one at a time to attribute each ack to exactly one caller.
+        self._confirmed_write_lock = threading.Lock()
 
         # Called with the decoded TTLV fields from any read/write response
         # or unsolicited status push. Fields carry the property's numeric
         # TSL id (not its string code) — see local_protocol.field_for_property.
         self.on_update: Callable[[list[TTLVField]], None] | None = None
-
-        # Called with the decoded fields from a CMD_WRITE_ACK reply. Kept
-        # separate from on_update since this payload's meaning is still
-        # unconfirmed (see module docstring) and doesn't belong in the
-        # property cache.
+        # Called with the decoded fields from a CMD_WRITE_ACK reply.
         self.on_write_ack: Callable[[list[TTLVField]], None] | None = None
-
-        # Called with no arguments when the connection is lost
-        # unexpectedly — a broken socket, or the device closing its end —
-        # as opposed to a clean, caller-initiated disconnect(), which never
-        # calls this. See _recv_loop.
+        # Called with no arguments when the connection is lost unexpectedly —
+        # a broken socket, the device closing its end, or a heartbeat/data
+        # timeout — never for a caller-initiated disconnect().
         self.on_disconnect: Callable[[], None] | None = None
 
-        self._write_ack_event: threading.Event | None = None
+        self._frame_handlers: dict[int, Callable[[list[TTLVField]], None]] = {
+            CMD_RANDOM_REPLY: self._on_random_reply,
+            CMD_LOGIN_RESULT: self._on_login_result,
+            CMD_READ_WRITE_RESP: self._on_data,
+            CMD_STATUS_PUSH: self._on_data,
+            CMD_STATUS_PUSH_OBSERVED: self._on_data,
+            CMD_WRITE_ACK: self._on_write_ack,
+        }
 
     @property
     def is_connected(self) -> bool:
-        """Whether the local TCP connection is currently up and logged in.
-        Complements on_disconnect for a polling-style check (e.g. a
-        periodic device-availability refresh) rather than only an
-        event-driven one.
-        """
-        return self._sock is not None and self._logged_in.is_set() and not self._shutting_down
+        """Whether the connection is up and logged in. The polling-style
+        complement to on_disconnect."""
+        return self._session_iv is not None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def connect(self, timeout: float = LOGIN_TIMEOUT) -> None:
         """Open the TCP connection and complete the login handshake
         (blocking until logged in, login is rejected, or `timeout` elapses).
+
+        Any existing connection is closed first, and `properties` is
+        cleared: values from a previous session may be stale. Raises
+        ConnectionError if login fails or times out.
         """
+        self.disconnect()
+        with self._state_changed:
+            self.properties.clear()
+            self._property_revision.clear()
+            self._data_probe_started = None
         sock = socket.create_connection((self._ip, self._port), timeout=5.0)
         sock.settimeout(0.5)
-        self._sock = sock
-        self._shutting_down = False
-        self._login_failed = False
-        self._logged_in.clear()
-        self._data_probe_started = None
-        self.properties.clear()
-        self._property_revision.clear()
+        self._login_done.clear()
+        with self._state_changed:
+            self._sock = sock
+        threading.Thread(target=self._recv_loop, args=(sock,), daemon=True).start()
 
-        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
-        self._recv_thread.start()
-
-        self._send(CMD_REQUEST_RANDOM, b"")
-
-        if not self._logged_in.wait(timeout):
+        try:
+            self._send(CMD_REQUEST_RANDOM, b"")
+            if not self._login_done.wait(timeout):
+                raise ConnectionError("Landbook local login timed out")
+            if not self.is_connected:
+                raise ConnectionError("Landbook local login rejected")
+        except BaseException:
             self.disconnect()
-            raise ConnectionError("Landbook local login timed out")
-        if self._login_failed:
-            self.disconnect()
-            raise ConnectionError("Landbook local login rejected")
+            raise
 
     def disconnect(self) -> None:
-        self._shutting_down = True
-        if self._heartbeat_timer:
-            self._heartbeat_timer.cancel()
-            self._heartbeat_timer = None
-        if self._sock:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
-        self._logged_in.clear()
-        with self._property_updated:
-            self._property_updated.notify_all()
+        with self._state_changed:
+            timer, self._heartbeat_timer = self._heartbeat_timer, None
+            if timer is not None:
+                timer.cancel()
+            sock, self._sock = self._sock, None
+            self._session_iv = None
+            self._random_challenge = None
+            if sock is not None:
+                _close_quietly(sock)
+            self._state_changed.notify_all()
 
     def read(self, ids: list[int]) -> None:
         """Request the current values of the given property ids (TSL
@@ -344,26 +352,19 @@ class LandbookLocalClient:
         self._send(CMD_READ, encode_id_list(ids))
 
     def read_and_wait(self, ids: list[int], timeout: float = 10.0) -> dict[int, Any]:
-        """Send a read request, then wait for the given property ids to
-        show up in `self.properties` (populated passively from whatever
-        the device pushes on its own — see `read()`'s docstring), up to
-        `timeout` seconds.
+        """Send a read request, then wait up to `timeout` seconds for the
+        given property ids to show up in `self.properties`.
 
         Returns whatever is known for the requested ids once all of them
         are present, or a partial (possibly empty) result if `timeout`
-        elapses first — this never raises on timeout, since "some
-        properties arrived, some haven't yet" is the expected steady state
-        for a device that reports asynchronously rather than replying
-        synchronously.
+        elapses or the connection drops first — this never raises on
+        timeout, since "some properties arrived, some haven't yet" is the
+        expected steady state for a device that reports asynchronously
+        rather than replying synchronously.
         """
         self.read(ids)
-        deadline = time.monotonic() + timeout
-        with self._property_updated:
-            while not all(i in self.properties for i in ids):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._property_updated.wait(timeout=remaining)
+        with self._state_changed:
+            self._wait_for(lambda: all(i in self.properties for i in ids), timeout)
             return {i: self.properties[i] for i in ids if i in self.properties}
 
     def write(self, fields: list[TTLVField]) -> None:
@@ -371,8 +372,7 @@ class LandbookLocalClient:
         local_protocol.field_for_property().
 
         Confirmed working against real hardware: a bool write visibly
-        turned a fan on. The device replies with CMD_WRITE_ACK; its
-        payload's exact meaning is still unconfirmed (see module docstring).
+        turned a fan on. The device replies with CMD_WRITE_ACK.
         """
         self._send(CMD_WRITE, encode_fields(fields))
 
@@ -380,283 +380,253 @@ class LandbookLocalClient:
         """Write property values and wait for the device's CMD_WRITE_ACK.
 
         Returns True if an ack arrived within *timeout* seconds, False
-        otherwise.  A missing ack means the device either didn't receive
-        the command or is in a half-open state where the socket accepts
-        bytes but the firmware doesn't process them — callers should fall
-        back to an alternative control path (e.g. cloud MQTT).
+        otherwise (including if the connection drops first). A missing ack
+        means the device either didn't receive the command or is in a
+        half-open state where the socket accepts bytes but the firmware
+        doesn't process them — callers should fall back to an alternative
+        control path (e.g. cloud MQTT). Concurrent calls are serialized.
         """
-        evt = threading.Event()
-        self._write_ack_event = evt
-        try:
+        with self._confirmed_write_lock:
+            with self._state_changed:
+                acks_before = self._write_acks
             self.write(fields)
-            return evt.wait(timeout)
-        finally:
-            self._write_ack_event = None
+            return self._wait_for(lambda: self._write_acks > acks_before, timeout)
 
     def write_and_confirm(self, fields: list[TTLVField], timeout: float = 10.0) -> bool:
-        """Wait for fresh property values matching a write, not merely its ACK.
+        """Write property values, request them back, and wait up to
+        *timeout* seconds for the device to report every one of them anew
+        with the written value.
 
-        Cached values, heartbeat replies and CMD_WRITE_ACK cannot satisfy
-        this check. False means unconfirmed, not necessarily unapplied;
-        callers may retry idempotent property assignments via another path.
+        Stricter than write_and_wait(): an ack, a heartbeat reply, or a
+        cached value that already matched doesn't count. False means
+        unconfirmed, not necessarily unapplied, so only retry idempotent
+        assignments on another path.
+
+        Holds the same lock as write_and_wait() for the whole wait, so
+        concurrent confirmed writes (e.g. fan speed and light together) run
+        one after another, each blocking the next for up to *timeout*.
+        Sharing the lock keeps this write's ack from being counted by a
+        concurrent write_and_wait().
         """
         if not fields:
             return False
-        # Normalize booleans (encoded in the TTLV type, often value=None)
-        # and numeric wire precision using the same decoder as device data.
+        # Round-trip through the wire format so the comparison sees what the
+        # device will report: a bool lives in the TTLV type (its value may
+        # be None), and numbers carry the wire's precision.
         expected = {f.id: f.value for f in decode_fields(encode_fields(fields))}
-        with self._write_confirmation_lock, self._property_updated:
-            revisions = {i: self._property_revision.get(i, 0) for i in expected}
+        with self._confirmed_write_lock:
+            with self._state_changed:
+                revisions = {i: self._property_revision.get(i, 0) for i in expected}
             self.write(fields)
             self.read(list(expected))
-            deadline = time.monotonic() + timeout
-            while True:
-                if all(
+            return self._wait_for(
+                lambda: all(
                     self._property_revision.get(i, 0) > revisions[i]
                     and self.properties.get(i) == value
                     for i, value in expected.items()
-                ):
-                    return True
-                remaining = deadline - time.monotonic()
-                if self._shutting_down or self._sock is None or remaining <= 0:
-                    return False
-                self._property_updated.wait(remaining)
+                ),
+                timeout,
+            )
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _next_packet_id(self) -> int:
-        with self._wire_lock:
+    def _wait_for(self, predicate: Callable[[], bool], timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._state_changed:
+            while not predicate():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._sock is None:
+                    return False
+                self._state_changed.wait(remaining)
+            return True
+
+    def _send(self, cmd: int, payload: bytes) -> None:
+        with self._send_lock:
+            sock = self._sock
+            if sock is None:
+                raise ConnectionError("Landbook local client is not connected")
+            if self._session_iv is not None:
+                payload = self._cipher().encrypt(pad(payload, AES.block_size))
             self._packet_id += 1
             if self._packet_id >= _PACKET_ID_WRAP:
                 self._packet_id = _PACKET_ID_START
-            return self._packet_id
+            sock.sendall(encode_frame(cmd, payload, self._packet_id))
 
-    def _send(self, cmd: int, payload: bytes) -> None:
-        assert self._sock is not None
-        if self._cipher_key is not None:
-            payload = self._encrypt(payload)
-        frame = encode_frame(cmd, payload, self._next_packet_id())
-        with self._wire_lock:
-            self._sock.sendall(frame)
+    def _cipher(self):
+        return AES.new(self._auth_key, AES.MODE_CBC, self._session_iv)
 
-    def _encrypt(self, payload: bytes) -> bytes:
-        assert self._cipher_key is not None and self._cipher_iv is not None
-        cipher = AES.new(self._cipher_key, AES.MODE_CBC, self._cipher_iv)
-        return cipher.encrypt(pad(payload, AES.block_size))
+    def _decode_payload(self, payload: bytes) -> list[TTLVField]:
+        if self._session_iv is not None:
+            payload = unpad(self._cipher().decrypt(payload), AES.block_size)
+        return decode_fields(payload)
 
-    def _decrypt(self, payload: bytes) -> bytes:
-        assert self._cipher_key is not None and self._cipher_iv is not None
-        cipher = AES.new(self._cipher_key, AES.MODE_CBC, self._cipher_iv)
-        return unpad(cipher.decrypt(payload), AES.block_size)
-
-    def _recv_loop(self) -> None:
-        while not self._shutting_down and self._sock is not None:
-            try:
-                chunk = self._sock.recv(4096)
-            except TimeoutError:
-                continue
-            except OSError:
-                break
-            if not chunk:
-                break
-            try:
-                frames = self._decoder.feed(chunk)
-            except ProtocolError as exc:
-                _LOGGER.warning("Landbook local: dropping malformed frame: %s", exc)
-                continue
-            for frame in frames:
-                _LOGGER.debug(
-                    "Landbook local: recv cmd=%s packet_id=%s payload_len=%d",
-                    frame.cmd,
-                    frame.packet_id,
-                    len(frame.payload),
-                )
-                self._handle_frame(frame)
-        # Only an unexpected exit (broken socket, or the device closing its
-        # end) gets here with _shutting_down still False — a caller-driven
-        # disconnect() sets it before touching the socket, so the loop
-        # condition itself ends things cleanly with nothing to report.
-        if not self._shutting_down and self.on_disconnect:
+    def _recv_loop(self, sock: socket.socket) -> None:
+        decoder = FrameDecoder()
+        try:
+            while self._sock is sock:
+                try:
+                    chunk = sock.recv(4096)
+                except TimeoutError:
+                    continue
+                if not chunk:
+                    break
+                for frame in decoder.feed(chunk):
+                    self._handle_frame(frame)
+        except OSError:
+            pass
+        with self._state_changed:
+            unexpected = self._sock is sock
+            if unexpected:
+                self.disconnect()
+        if unexpected and self.on_disconnect:
             self.on_disconnect()
 
     def _handle_frame(self, frame: DecodedFrame) -> None:
-        if frame.cmd == CMD_RANDOM_REPLY:
-            self._on_random_reply(frame.payload)
-        elif frame.cmd == CMD_LOGIN_RESULT:
-            self._on_login_result(frame.payload)
-        elif frame.cmd in (CMD_READ_WRITE_RESP, CMD_STATUS_PUSH, CMD_STATUS_PUSH_OBSERVED):
-            self._on_data(frame.payload)
-        elif frame.cmd == CMD_WRITE_ACK:
-            self._on_write_ack(frame.payload)
-        elif frame.cmd == CMD_HEARTBEAT_REPLY:
-            self._last_pong = time.monotonic()
-        else:
-            # Other cmds (wifi-list management, etc.) are part of the wider
-            # protocol but not needed for property read/write. Opportunistically
-            # try to decrypt/decode anyway and log the result — exploratory,
-            # while we're still confirming which cmd numbers this product
-            # actually uses for what.
-            self._try_decode_unknown(frame.cmd, frame.payload)
-
-    def _try_decode_unknown(self, cmd: int, payload: bytes) -> None:
-        if self._cipher_key is None:
-            _LOGGER.debug("Landbook local: unhandled cmd=%s (pre-auth), ignoring", cmd)
-            return
-        try:
-            decrypted = self._decrypt(payload)
-            fields = decode_fields(decrypted)
-        except (ValueError, ProtocolError) as exc:
-            _LOGGER.debug(
-                "Landbook local: unhandled cmd=%s, decode failed (%s), raw payload: %s",
-                cmd,
-                exc,
-                payload.hex(),
-            )
-            return
-        _LOGGER.debug("Landbook local: unhandled cmd=%s decoded successfully: %s", cmd, fields)
-
-    def _on_random_reply(self, payload: bytes) -> None:
-        try:
-            fields = decode_fields(payload)
-        except ProtocolError:
-            _LOGGER.warning("Landbook local: malformed random-challenge reply")
-            return
-        random_field = next((f for f in fields if f.id == 1), None)
-        if random_field is None:
-            _LOGGER.warning("Landbook local: random-challenge reply missing id=1 field")
-            return
-        random_str = random_field.value.decode("utf-8")
-        self._random_challenge = random_str
-        sign = hashlib.sha256(f"{self._auth_key.hex()};{random_str}".encode()).hexdigest()
-        login_payload = encode_fields([TTLVField(2, 3, sign.encode())])
-        self._send(CMD_LOGIN, login_payload)
-
-    def _on_login_result(self, payload: bytes) -> None:
-        try:
-            fields = decode_fields(payload)
-        except ProtocolError:
-            self._login_failed = True
-            self._logged_in.set()
-            return
-        result_field = next((f for f in fields if f.id == 3), None)
-        result = int(result_field.value) if result_field is not None else 1
-        if result not in (0, 2):
-            _LOGGER.warning("Landbook local: login rejected, result=%s", result)
-            self._login_failed = True
-            self._logged_in.set()
-            return
-        assert self._random_challenge is not None
-        self._cipher_key = self._auth_key
-        self._cipher_iv = self._random_challenge.encode("utf-8")
-        self._last_pong = time.monotonic()
-        self.last_property_update = time.monotonic()
-        self._logged_in.set()
-        self._send(
-            CMD_HEARTBEAT_START,
-            encode_fields([TTLVField(1, TYPE_NUMBER, 30), TTLVField(2, TYPE_NUMBER, 1)]),
+        _LOGGER.debug(
+            "Landbook local: recv cmd=%s packet_id=%s payload_len=%d",
+            frame.cmd,
+            frame.packet_id,
+            len(frame.payload),
         )
-        self._schedule_heartbeat()
+        if frame.cmd == CMD_HEARTBEAT_REPLY:
+            self._last_pong = time.monotonic()
+            return
 
-    def _decrypt_and_decode(self, payload: bytes, what: str) -> list[TTLVField] | None:
-        raw = payload
-        if self._cipher_key is not None:
-            try:
-                payload = self._decrypt(payload)
-            except ValueError as exc:
-                _LOGGER.warning(
-                    "Landbook local: failed to decrypt %s (%s), raw payload: %s",
-                    what,
-                    exc,
-                    raw.hex(),
-                )
-                return None
+        # Cmds without a handler (wifi-list management, etc.) are part of the
+        # wider protocol but not needed for property read/write. They're
+        # still decoded and logged at debug level, while it's still unclear
+        # which cmd numbers this product uses for what.
+        handler = self._frame_handlers.get(frame.cmd)
         try:
-            return decode_fields(payload)
-        except ProtocolError as exc:
-            _LOGGER.warning(
-                "Landbook local: malformed %s (%s), decrypted payload: %s", what, exc, payload.hex()
+            fields = self._decode_payload(frame.payload)
+        except (ValueError, ProtocolError) as exc:
+            _LOGGER.log(
+                logging.WARNING if handler else logging.DEBUG,
+                "Landbook local: undecodable cmd=%s (%s), raw payload: %s",
+                frame.cmd,
+                exc,
+                frame.payload.hex(),
             )
-            return None
+            return
+        if handler is None:
+            _LOGGER.debug("Landbook local: unhandled cmd=%s: %s", frame.cmd, fields)
+            return
+        try:
+            handler(fields)
+        except OSError:
+            raise
+        except Exception:
+            _LOGGER.exception("Landbook local: error handling cmd=%s", frame.cmd)
 
-    def _on_data(self, payload: bytes) -> None:
-        fields = self._decrypt_and_decode(payload, "data frame")
+    def _on_random_reply(self, fields: list[TTLVField]) -> None:
+        challenge = _field_value(fields, _RANDOM_FIELD_CHALLENGE)
+        if challenge is None:
+            _LOGGER.warning("Landbook local: random-challenge reply missing its challenge field")
+            return
+        self._random_challenge = challenge.decode("utf-8")
+        sign = hashlib.sha256(f"{self._auth_key.hex()};{self._random_challenge}".encode())
+        login = TTLVField(_LOGIN_FIELD_SIGN, TYPE_BYTES, sign.hexdigest().encode())
+        self._send(CMD_LOGIN, encode_fields([login]))
+
+    def _on_login_result(self, fields: list[TTLVField]) -> None:
+        result = _field_value(fields, _LOGIN_RESULT_FIELD)
+        if result not in _LOGIN_RESULT_ACCEPTED or self._random_challenge is None:
+            _LOGGER.warning("Landbook local: login rejected, result=%s", result)
+            self._login_done.set()
+            return
+        self._session_iv = self._random_challenge.encode("utf-8")
+        self._last_pong = self.last_property_update = time.monotonic()
+        self._send(CMD_HEARTBEAT_START, encode_fields(_HEARTBEAT_START_FIELDS))
+        with self._state_changed:
+            if self._sock is not None:
+                self._schedule_heartbeat(self._sock)
+        self._login_done.set()
+
+    def _on_data(self, fields: list[TTLVField]) -> None:
+        # An empty frame carries no properties, so it's no evidence the
+        # data plane is alive.
         if not fields:
             return
-        self.last_property_update = time.monotonic()
-        with self._property_updated:
+        with self._state_changed:
+            self.last_property_update = time.monotonic()
             self._data_probe_started = None
             for f in fields:
                 self.properties[f.id] = f.value
                 self._property_revision[f.id] = self._property_revision.get(f.id, 0) + 1
-            self._property_updated.notify_all()
+            self._state_changed.notify_all()
         if self.on_update:
             self.on_update(fields)
 
-    def _on_write_ack(self, payload: bytes) -> None:
-        fields = self._decrypt_and_decode(payload, "write ack")
-        if fields is None:
-            return
+    def _on_write_ack(self, fields: list[TTLVField]) -> None:
         _LOGGER.debug("Landbook local: write ack: %s", fields)
-        evt = self._write_ack_event
-        if evt is not None:
-            evt.set()
+        with self._state_changed:
+            self._write_acks += 1
+            self._state_changed.notify_all()
         if self.on_write_ack:
             self.on_write_ack(fields)
 
-    def _send_heartbeat(self) -> None:
-        if self._shutting_down:
+    def _schedule_heartbeat(self, sock: socket.socket) -> None:
+        timer = threading.Timer(HEARTBEAT_INTERVAL, self._send_heartbeat, args=(sock,))
+        timer.daemon = True
+        self._heartbeat_timer = timer
+        timer.start()
+
+    def _send_heartbeat(self, sock: socket.socket) -> None:
+        """Each heartbeat chain belongs to one socket and ends with it, so a
+        tick racing disconnect()/connect() can't touch the next session."""
+        if self._sock is not sock:
             return
-        if self._last_pong and time.monotonic() - self._last_pong > HEARTBEAT_PONG_TIMEOUT:
+        now = time.monotonic()
+        if now - self._last_pong > HEARTBEAT_PONG_TIMEOUT:
             _LOGGER.warning(
                 "Landbook local: heartbeat pong timeout (no reply in %.0fs), tearing down",
-                time.monotonic() - self._last_pong,
+                now - self._last_pong,
             )
-            self._force_disconnect()
+            _close_quietly(sock)
             return
-        if (
-            self.last_property_update
-            and time.monotonic() - self.last_property_update > DATA_STALL_TIMEOUT
-        ):
-            # Pongs only prove the heartbeat handler is alive. Ask for real
-            # properties before declaring a quiet data plane wedged. Never
-            # use read_and_wait here: it can immediately return cached data.
-            now = time.monotonic()
-            with self._property_updated:
+        if now - self.last_property_update > DATA_STALL_TIMEOUT:
+            with self._state_changed:
                 ids = list(self.properties)
-                if self._data_probe_started is None and ids:
+                probe_started = self._data_probe_started
+                if probe_started is None and ids:
                     self._data_probe_started = now
-                    try:
-                        self.read(ids)
-                    except OSError:
-                        self._force_disconnect()
-                        return
-                    _LOGGER.debug("Landbook local: property silence; requesting fresh status")
-                elif not ids or now - self._data_probe_started >= DATA_PROBE_TIMEOUT:
-                    _LOGGER.warning(
-                        "Landbook local: data stall; fresh status probe failed, tearing down"
-                    )
-                    self._force_disconnect()
+            # With no known ids there's nothing to probe for.
+            if not ids or (probe_started is not None and now - probe_started >= DATA_PROBE_TIMEOUT):
+                _LOGGER.warning(
+                    "Landbook local: data stall (no property push in %.0fs), tearing down",
+                    now - self.last_property_update,
+                )
+                _close_quietly(sock)
+                return
+            if probe_started is None:
+                # Pongs only prove the heartbeat handler is alive, so ask for
+                # real properties. Not read_and_wait(): cached values would
+                # satisfy it immediately.
+                _LOGGER.debug("Landbook local: property silence, requesting fresh status")
+                try:
+                    self.read(ids)
+                except OSError:
+                    _close_quietly(sock)
                     return
+        try:
             self._send(CMD_HEARTBEAT_PING, b"")
-            self._schedule_heartbeat()
+        except OSError:
             return
-        self._send(CMD_HEARTBEAT_PING, b"")
-        self._schedule_heartbeat()
+        with self._state_changed:
+            if self._sock is sock:
+                self._schedule_heartbeat(sock)
 
-    def _schedule_heartbeat(self) -> None:
-        self._heartbeat_timer = threading.Timer(HEARTBEAT_INTERVAL, self._send_heartbeat)
-        self._heartbeat_timer.daemon = True
-        self._heartbeat_timer.start()
 
-    def _force_disconnect(self) -> None:
-        """Tear down the socket so _recv_loop exits and fires on_disconnect."""
-        if self._heartbeat_timer:
-            self._heartbeat_timer.cancel()
-            self._heartbeat_timer = None
-        if self._sock:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
+def _close_quietly(sock: socket.socket) -> None:
+    """Closing (without detaching) makes the receive loop see the failure,
+    tear the connection down and fire on_disconnect."""
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _field_value(fields: list[TTLVField], field_id: int) -> Any:
+    return next((f.value for f in fields if f.id == field_id), None)
