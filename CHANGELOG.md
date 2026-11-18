@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/zackwag/landbook-api/compare/v0.9.0...v0.10.0) (2026-11-18)
+
+
+### Features
+
+* untangle client lifecycles and fix connection-state bugs ([#41](https://github.com/zackwag/landbook-api/issues/41)) ([2155b2d](https://github.com/zackwag/landbook-api/commit/2155b2d84fcec19ee06e022672cafc4686aaf083))
+
 ## [0.9.0](https://github.com/zackwag/landbook-api/compare/v0.8.0...v0.9.0) (2026-09-25)
 
 
