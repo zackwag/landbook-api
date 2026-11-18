@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/zackwag/landbook-api/compare/v0.10.0...v0.10.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* probe quiet local sessions and confirm writes with fresh properties ([#40](https://github.com/zackwag/landbook-api/issues/40)) ([3f4581d](https://github.com/zackwag/landbook-api/commit/3f4581d0f4128240236cf6ce0c28651bd66a9378))
+
 ## [0.10.0](https://github.com/zackwag/landbook-api/compare/v0.9.0...v0.10.0) (2026-11-18)
 
 
